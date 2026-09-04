@@ -63,7 +63,7 @@
   <rect x="566" y="314" width="150" height="22" rx="4" fill="#ffffff" stroke="#d0d7de"/>
   <text x="576" y="329" font-size="11.5" font-family="ui-monospace,SFMono-Regular,Consolas,monospace" fill="#cf222e">access_denied</text>
 
-  <rect x="548" y="366" width="308" height="80" rx="8" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1.5"/>
+  <rect x="548" y="366" width="308" height="96" rx="8" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1.5"/>
   <text x="566" y="392" font-size="12.5" font-weight="600" fill="#1f2328">Why blank is safe</text>
   <text x="566" y="414" font-size="11.5" fill="#656d76">These fields appear on the consent screen</text>
   <text x="566" y="431" font-size="11.5" fill="#656d76">shown to external users. In Testing, with</text>

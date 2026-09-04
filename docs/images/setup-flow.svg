@@ -55,7 +55,7 @@
   <g stroke="#8c959f" stroke-width="1.6" fill="none" marker-end="url(#a)">
     <path d="M284,122 H296"/>
     <path d="M428,122 H440"/>
-    <path d="M508,152 V220"/>
+    <path d="M508,152 V186 H364 V220"/>
     <path d="M428,256 H440"/>
     <path d="M572,256 H584"/>
     <path d="M716,256 H756 V158"/>

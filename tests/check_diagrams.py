@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """Structural checks for the hand-authored SVG diagrams in docs/images.
 
-Catches the two failure modes that are invisible without rendering:
+Catches three failure modes that are invisible without rendering:
 
   1. content that overflows the viewBox
   2. arrows that terminate in empty space instead of at a box
+  3. text that spills past the bottom of its own panel
 
 Written after a dashed arrow in setup-flow.svg was found pointing 28px short
 of its target, which XML validation could not detect.
+
+LIMITATION: this checks geometry, not meaning. An arrow that lands squarely
+on the *wrong* box passes every test here - setup-flow.svg shipped with its
+step 3 arrow pointing at step 5, skipping step 4, and this script called it
+clean. Diagrams still need looking at. Serve them and open in a browser:
+
+    python -m http.server 8765 --directory docs/images
 
 Run: python tests/check_diagrams.py
 """
@@ -83,6 +91,32 @@ def check(path):
         if near > TOLERANCE:
             problems.append(
                 "arrow ends {:.0f}px from any box (d={})".format(near, d))
+
+    # Text sitting inside a panel must not spill past that panel's bottom
+    # edge. A baseline 2px below its box still renders "inside the viewBox",
+    # so the viewBox check above cannot see this.
+    for text in root.iter(NS + "text"):
+        tx, ty = float(text.get("x", 0)), float(text.get("y", 0))
+        size = float(text.get("font-size", 12))
+        descender = ty + size * 0.25
+        # The panel this text belongs to is the innermost box that contains
+        # the baseline vertically, allowing one line-height of slack so that
+        # text which has just spilled out still resolves to its own panel
+        # rather than being silently reassigned to the one outside it.
+        panel = None
+        for b in boxes:
+            bx, by = float(b.get("x", 0)), float(b.get("y", 0))
+            bw, bh = float(b.get("width", 0)), float(b.get("height", 0))
+            if bx <= tx <= bx + bw and by <= ty <= by + bh + size:
+                if panel is None or by > float(panel.get("y", 0)):
+                    panel = b
+        if panel is None:
+            continue
+        bottom = float(panel.get("y", 0)) + float(panel.get("height", 0))
+        if descender > bottom:
+            problems.append(
+                "text at y={:g} spills past its panel bottom {:g}: {!r}".format(
+                    ty, bottom, (text.text or "")[:34]))
     return problems
 
 
