@@ -51,6 +51,23 @@ then follow Google's instructions for the Cloud SDK at
 npm install -g @googleworkspace/cli
 ```
 
+> ### If `gws` is "not found" right after installing it
+> `npm install -g` puts binaries in npm's global prefix, which is not always on
+> PATH. Find it and add it:
+> ```bash
+> npm config get prefix        # macOS/Linux: append /bin to this
+> npm prefix -g
+> ```
+> On Windows the location is `%APPDATA%\npm`. On macOS/Linux it is usually
+> `/usr/local/bin` or `~/.npm-global/bin`. See the PATH note below.
+
+> ### `python` vs `python3`
+> This guide writes `python`. On macOS and most Linux distributions the
+> command is **`python3`** — substitute it throughout. On Windows, a bare
+> `python` may open the Microsoft Store instead of running Python; if that
+> happens, use `py` instead, or turn off the alias under
+> Settings → Apps → Advanced app settings → App execution aliases.
+
 ### Get the tool itself
 
 ```bash
@@ -329,3 +346,85 @@ this. It does not fit here:
   above), a template, and broad `cloud-platform` scope on your account.
 
 The `gmail.modify` scope is what actually prevents irreversible deletion.
+
+---
+
+## Troubleshooting
+
+Indexed by the literal error text, since that is what you will search for.
+
+### `error: unrecognized subcommand` / `command not found: gws`
+
+`gws` is installed but not on PATH, or the shell predates the install. Open a
+new terminal first. If it persists, see the npm global prefix note in step 1.
+
+### `Invalid --params JSON: key must be a string at line 1 column 2`
+
+PowerShell stripped the quotes from your JSON. Escape them:
+
+```powershell
+gws gmail users getProfile --params '{\"userId\":\"me\"}'
+```
+
+### `Access denied. No credentials provided.`
+
+You have not completed `gws auth login`, or the credentials file is missing
+from `~/.config/gws/client_secret.json`. See steps 6–8.
+
+### `Request had insufficient authentication scopes.` (403)
+
+The token lacks Gmail access. **`gws auth status` is not a reliable check** —
+it reports requested scopes, not granted ones. Causes, in order of likelihood:
+
+1. You logged in without `--scopes` and got identity-only scopes.
+2. `gmail.modify` is not declared under **Data Access** (step 5).
+3. You left the Gmail permission checkbox unticked at the consent screen.
+4. Google replayed a cached grant without prompting — revoke the app at
+   <https://myaccount.google.com/permissions> and log in again.
+
+### `access_denied` during browser login
+
+Your own address is not listed as a **Test user** on the consent screen, or the
+app is in Testing and you signed in with a different account.
+
+### Google demands an "authorized domain"
+
+You filled in App home page, Privacy policy, or Terms of service. Clear all
+three — they are optional, and the desktop flow uses `127.0.0.1`, so no domain
+is involved. See step 4.
+
+### `OAuth client creation requires manual setup in the Google Cloud Console`
+
+Expected. `gws auth setup` enables the APIs but cannot create the OAuth client.
+Continue with steps 4–7.
+
+### `Quota exceeded for quota metric 'Total Query Cost'`
+
+You are over Gmail's per-minute quota. Lower `--concurrency` to 12 or below.
+The tool retries with backoff, but sustained over-concurrency drops messages.
+Quota is consumed by any recent activity, so wait a minute before retrying.
+
+### `UnicodeDecodeError: 'charmap' codec can't decode byte`
+
+An older copy of the tool. Current versions force UTF-8 on subprocess output.
+Pull the latest.
+
+### `FileNotFoundError: [WinError 2]` from Python
+
+Python cannot execute the `gws.cmd` shim by bare name. The tool resolves the
+real `.exe` automatically; if it fails, set it explicitly:
+
+```powershell
+$env:GWS_BIN = "$env:APPDATA\npm\node_modules\@googleworkspace\cli\bin\gws.exe"
+```
+
+### `engaged` wrote 0 addresses
+
+The tool now exits with an error rather than writing an empty safeguard list.
+If you see this, the `To`/`Cc` headers were not returned — check that you are
+on a current version.
+
+### Auth worked yesterday, fails today
+
+External apps in *Testing* status issue refresh tokens that expire after
+**7 days**. Re-run `gws auth login`.
