@@ -4,6 +4,8 @@ Getting `gws` authenticated against Gmail takes about 20 minutes, and roughly
 half the steps cannot be automated. Several of them fail in confusing ways —
 this guide calls out each trap where you'd hit it.
 
+![Setup flow](images/setup-flow.svg)
+
 ---
 
 ## 1. Install the prerequisites
@@ -129,6 +131,8 @@ Two things to expect:
 
 `https://console.cloud.google.com/apis/credentials/consent?project=<PROJECT_ID>`
 
+![Consent screen](images/consent-screen.svg)
+
 - User Type: **External**
 - Fill in **only**: App name, User support email, Developer contact email
 - **Add your own Google address as a Test user** — omitting this causes
@@ -148,6 +152,8 @@ Two things to expect:
 
 ## 5. Declare the scope
 
+![Scope declaration and verification](images/scope-and-verify.svg)
+
 Google Auth Platform → **Data Access** → Add or remove scopes → add:
 
 ```
@@ -165,6 +171,8 @@ https://www.googleapis.com/auth/gmail.modify
 `https://console.cloud.google.com/apis/credentials?project=<PROJECT_ID>`
 
 Create Credentials → OAuth client ID → Application type: **Desktop app**.
+
+![OAuth client type](images/oauth-client-type.svg)
 
 ### Why Desktop app, and not Web / Chrome extension / Android
 

@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 430" width="880" height="430" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
+  <rect width="880" height="430" fill="#ffffff"/>
+  <text x="24" y="32" font-size="17" font-weight="600" fill="#1f2328">Step 6 — Application type must be "Desktop app"</text>
+  <text x="24" y="53" font-size="12.5" fill="#656d76">Credentials → Create Credentials → OAuth client ID</text>
+
+  <!-- dropdown -->
+  <rect x="24" y="76" width="330" height="300" rx="8" fill="#ffffff" stroke="#d0d7de" stroke-width="1.5"/>
+  <text x="44" y="104" font-size="11.5" fill="#656d76">Application type</text>
+
+  <rect x="44" y="116" width="290" height="38" rx="5" fill="#dafbe1" stroke="#1a7f37" stroke-width="2"/>
+  <circle cx="62" cy="135" r="5.5" fill="#1a7f37"/>
+  <text x="78" y="140" font-size="13" font-weight="600" fill="#1f2328">Desktop app</text>
+  <text x="244" y="140" font-size="11.5" font-weight="600" fill="#1a7f37">← this one</text>
+
+  <g opacity="0.6">
+    <rect x="44" y="164" width="290" height="34" rx="5" fill="#f6f8fa" stroke="#d0d7de"/>
+    <circle cx="62" cy="181" r="5.5" fill="none" stroke="#8c959f"/>
+    <text x="78" y="186" font-size="12.5" fill="#656d76">Web application</text>
+
+    <rect x="44" y="206" width="290" height="34" rx="5" fill="#f6f8fa" stroke="#d0d7de"/>
+    <circle cx="62" cy="223" r="5.5" fill="none" stroke="#8c959f"/>
+    <text x="78" y="228" font-size="12.5" fill="#656d76">Chrome extension</text>
+
+    <rect x="44" y="248" width="290" height="34" rx="5" fill="#f6f8fa" stroke="#d0d7de"/>
+    <circle cx="62" cy="265" r="5.5" fill="none" stroke="#8c959f"/>
+    <text x="78" y="270" font-size="12.5" fill="#656d76">Android</text>
+
+    <rect x="44" y="290" width="290" height="34" rx="5" fill="#f6f8fa" stroke="#d0d7de"/>
+    <circle cx="62" cy="307" r="5.5" fill="none" stroke="#8c959f"/>
+    <text x="78" y="312" font-size="12.5" fill="#656d76">iOS / TVs and Limited Input</text>
+  </g>
+
+  <text x="44" y="352" font-size="11" fill="#656d76">No redirect URI to register —</text>
+  <text x="44" y="367" font-size="11" fill="#656d76">desktop clients use loopback.</text>
+
+  <!-- why -->
+  <text x="386" y="98" font-size="13" font-weight="600" fill="#1f2328">gws implements exactly one flow</text>
+  <rect x="386" y="108" width="470" height="92" rx="6" fill="#f6f8fa" stroke="#d0d7de"/>
+  <g font-family="ui-monospace,SFMono-Regular,Consolas,monospace" font-size="11" fill="#1f2328">
+    <text x="400" y="128">yup-oauth2\src\installed.rs</text><text x="640" y="128" fill="#656d76">the "installed app" flow</text>
+    <text x="400" y="145">struct InstalledConfig</text><text x="640" y="145" fill="#656d76">parses the `installed` key</text>
+    <text x="400" y="162">127.0.0.1:0</text><text x="640" y="162" fill="#656d76">random loopback port</text>
+    <text x="400" y="179">code_challenge → 0</text><text x="640" y="179" fill="#656d76">no PKCE</text>
+  </g>
+
+  <!-- reasons others fail -->
+  <text x="386" y="228" font-size="13" font-weight="600" fill="#cf222e">Why the others cannot work</text>
+
+  <g font-size="11.5">
+    <rect x="386" y="240" width="470" height="40" rx="5" fill="#ffebe9" stroke="#cf222e" stroke-width="1.2"/>
+    <text x="400" y="257" font-weight="600" fill="#1f2328">Web application</text>
+    <text x="400" y="272" fill="#656d76">JSON uses the `web` key, not `installed` — and the random port</text>
+
+    <rect x="386" y="288" width="470" height="40" rx="5" fill="#ffebe9" stroke="#cf222e" stroke-width="1.2"/>
+    <text x="400" y="305" font-weight="600" fill="#1f2328">Chrome extension</text>
+    <text x="400" y="320" fill="#656d76">Pinned to an extension ID; issued no client secret</text>
+
+    <rect x="386" y="336" width="470" height="40" rx="5" fill="#ffebe9" stroke="#cf222e" stroke-width="1.2"/>
+    <text x="400" y="353" font-weight="600" fill="#1f2328">Android / iOS</text>
+    <text x="400" y="368" fill="#656d76">Pinned to package name + SHA-1; public client, no secret, needs PKCE</text>
+  </g>
+
+  <text x="386" y="398" font-size="11.5" fill="#656d76">A CLI can present no extension ID and no signing fingerprint, and gws sends a</text>
+  <text x="386" y="414" font-size="11.5" fill="#656d76">client_secret with no PKCE — so a public-client flow cannot complete at all.</text>
+</svg>
