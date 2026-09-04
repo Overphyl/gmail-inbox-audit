@@ -222,6 +222,80 @@ minutes instead of an hour.
 
 ---
 
+## Implementation notes
+
+Read `CLAUDE.md` first — it carries the invariants, the offline test loop, and
+the platform gotchas. Symbols below are in `gmail_audit.py` unless noted.
+
+Both test suites run offline against fixtures with no Gmail access and no
+quota cost. Develop against those; hitting a real mailbox to test a change
+costs an hour and burns quota you will then be rate-limited by.
+
+### Phase 1 — shared rate limiter
+
+**Touch:** `gws()` (the `RETRYABLE` retry loop), `cmd_fetch()`, `_safe()`.
+
+Today each worker discovers the quota ceiling independently and sleeps up to
+60s alone. Replace that with one token bucket shared across the pool, sized
+adaptively: ramp until 429s appear, back off, settle. `--concurrency` becomes a
+parallelism knob rather than the de-facto rate control it is now.
+
+Keep the existing per-request retry as a backstop for genuinely transient
+failures; the limiter should mean it rarely fires.
+
+**Done when:** a 5,000-message fetch sustains >20 msg/s end-to-end with zero
+dropped messages, and the fetch reports its observed rate. A run that is fast
+but drops messages is a failure, not a partial success — dropped messages
+silently undercount senders.
+
+### Phase 2 — server, preflight, scan progress
+
+**Touch:** new `cmd_ui()`; reuse `list_ids()`, `cmd_fetch()`, `load_cache()`.
+
+`ThreadingHTTPServer` bound to `127.0.0.1` explicitly. Scan on a background
+thread. No mutating endpoint exists in this phase.
+
+**Done when:** the browser shows live progress, the observed rate, and
+rate-limit state; preflight correctly distinguishes "not authenticated" from
+"authenticated but missing the Gmail scope" — the 403 case that `gws auth
+status` misreports.
+
+### Phase 3 — review and selection
+
+**Touch:** `score_sender()`, `cmd_rank()` refactored to return rows rather than
+print them, so CLI and UI share one ranking path.
+
+**Done when:** selection in the UI produces exactly the set `cmd_trash` would
+act on given the equivalent `approved.txt`, verified by a test comparing both
+paths against the fixture.
+
+### Phase 4 — execute and undo
+
+**Touch:** `cmd_trash()`, `cmd_untrash()`, `_trash_one()`.
+
+The token check and output escaping from the security section must land
+**before** this phase adds any mutating endpoint. Not alongside it.
+
+**Done when:** a trash run through the UI writes the same manifest the CLI
+writes, Undo restores from it, and tests assert that a request without a valid
+token, or with a foreign `Origin`, is rejected.
+
+### Phase 5 — incremental scans
+
+**Touch:** new history-based fetch path; `getProfile` already returns
+`historyId`.
+
+**Done when:** a rescan after an initial full scan completes in seconds and
+finds new mail, with a documented fallback to a full scan when the stored
+`historyId` is too old — Gmail expires them.
+
+### Keeping this document honest
+
+The performance figures here are measurements from a specific run, not
+permanent properties. Once Phase 1 lands, "5.1 msg/s sustained" becomes
+historical; mark it as such rather than leaving a future reader to treat it as
+current behaviour.
+
 ## Risks and open questions
 
 **Handling the refresh token.** Direct HTTPS calls require the tool to obtain
