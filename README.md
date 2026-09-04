@@ -47,12 +47,58 @@ anything is trashed, so a complete undo list survives an interrupted run.
 
 ---
 
-## Requirements
+## Install
 
+- Node.js 18+ — runtime for `gws`
 - [`gws`](https://github.com/googleworkspace/google-workspace-cli) — the Google Workspace CLI
-- Python 3.8+ — **standard library only**, no pip install
+- Python 3.8+ — **standard library only**, no pip install, no virtualenv
 - Google Cloud SDK (`gcloud`) — needed once, for API enablement
-- A Google Cloud project
+- A Google Cloud project — free, no billing account required
+
+<details>
+<summary><b>Windows</b></summary>
+
+```powershell
+winget install OpenJS.NodeJS
+winget install Python.Python.3.12
+winget install Google.CloudSDK
+```
+
+Open a **new terminal** so PATH refreshes, then:
+
+```powershell
+npm install -g @googleworkspace/cli
+```
+</details>
+
+<details>
+<summary><b>macOS</b></summary>
+
+```bash
+brew install node python
+brew install --cask google-cloud-sdk
+npm install -g @googleworkspace/cli
+```
+</details>
+
+<details>
+<summary><b>Linux</b></summary>
+
+Node.js 18+ and Python 3.8+ from your package manager, the Cloud SDK per
+<https://cloud.google.com/sdk/docs/install>, then:
+
+```bash
+npm install -g @googleworkspace/cli
+```
+</details>
+
+Then get the tool:
+
+```bash
+git clone https://github.com/Overphyl/gmail-inbox-audit.git
+cd gmail-inbox-audit
+python tests/test_audit.py      # optional: 11 offline tests, no API access
+```
 
 ## Setup
 

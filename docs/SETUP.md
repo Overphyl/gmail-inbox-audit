@@ -6,14 +6,72 @@ this guide calls out each trap where you'd hit it.
 
 ---
 
-## 1. Prerequisites
+## 1. Install the prerequisites
 
 | Requirement | Purpose | Verify |
 |---|---|---|
+| Node.js 18+ | runtime for `gws` | `node --version` |
 | [`gws`](https://github.com/googleworkspace/google-workspace-cli) | Google Workspace CLI | `gws --version` |
 | Python 3.8+ | the audit pipeline (stdlib only) | `python --version` |
 | Google Cloud SDK (`gcloud`) | required by `gws auth setup` | `gcloud --version` |
 | A Google Cloud project | hosts your OAuth client | `gcloud config get-value project` |
+
+Python needs **no packages** — the tool is standard library only. There is no
+`pip install` step and no virtualenv to create.
+
+### Windows
+
+```powershell
+winget install OpenJS.NodeJS
+winget install Python.Python.3.12
+winget install Google.CloudSDK
+```
+
+Then **open a new terminal** (see the PATH note below) and install `gws`:
+
+```powershell
+npm install -g @googleworkspace/cli
+```
+
+### macOS
+
+```bash
+brew install node python
+brew install --cask google-cloud-sdk
+npm install -g @googleworkspace/cli
+```
+
+### Linux
+
+Install Node.js 18+ and Python 3.8+ from your distribution's package manager,
+then follow Google's instructions for the Cloud SDK at
+<https://cloud.google.com/sdk/docs/install>, and:
+
+```bash
+npm install -g @googleworkspace/cli
+```
+
+### Get the tool itself
+
+```bash
+git clone https://github.com/Overphyl/gmail-inbox-audit.git
+cd gmail-inbox-audit
+python tests/test_audit.py      # optional: 11 offline tests, no API access
+```
+
+### Create a Google Cloud project
+
+Skip this if you already have one you want to use. The Gmail API is free at
+this volume and **no billing account is required**.
+
+```bash
+gcloud projects create my-gmail-audit --name="Gmail Audit"
+gcloud config set project my-gmail-audit
+```
+
+Project IDs are globally unique, so `my-gmail-audit` may be taken — add a
+suffix if creation fails. You can also create one in the Console at
+<https://console.cloud.google.com/projectcreate>.
 
 > **Windows: stale PATH.** Installers modify `PATH`, but already-open shells
 > keep the old copy — winget says so explicitly ("restart your shell to use the
