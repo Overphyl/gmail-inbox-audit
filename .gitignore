@@ -1,0 +1,47 @@
+# ---------------------------------------------------------------------------
+# PERSONAL MAIL DATA - never commit any of this.
+#
+# The audit writes real message headers, real sender addresses and real message
+# IDs to disk. These files describe who you correspond with. Treat them like a
+# mailbox export, not like build output.
+# ---------------------------------------------------------------------------
+*.jsonl
+headers.jsonl
+engaged.txt
+approved.txt
+*manifest*.jsonl
+run.log
+*.log
+
+# ...but the test fixtures are synthetic and SHOULD be committed.
+!tests/fixtures/*.jsonl
+!tests/fixtures/*.txt
+
+# ---------------------------------------------------------------------------
+# CREDENTIALS - committing any of these would leak account access.
+# ---------------------------------------------------------------------------
+client_secret*.json
+credentials.json
+credentials.enc
+token*.json
+.env
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# ---------------------------------------------------------------------------
+# OS / editor
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
