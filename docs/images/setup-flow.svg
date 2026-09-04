@@ -58,7 +58,7 @@
     <path d="M508,152 V220"/>
     <path d="M428,256 H440"/>
     <path d="M572,256 H584"/>
-    <path d="M716,256 H780 V158"/>
+    <path d="M716,256 H756 V158"/>
   </g>
 
   <!-- setup stops note -->
@@ -72,5 +72,5 @@
   <rect x="588" y="322" width="268" height="52" rx="6" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.5"/>
   <text x="722" y="343" font-size="12.5" font-weight="600" fill="#1a7f37" text-anchor="middle">9. Verify with a real API call</text>
   <text x="722" y="361" font-size="11" fill="#1f2328" text-anchor="middle">gws gmail users getProfile — not `gws auth status`</text>
-  <path d="M794,158 V196 H560 V318" stroke="#8c959f" stroke-width="1.6" fill="none" marker-end="url(#a)" stroke-dasharray="4 3"/>
+  <path d="M794,158 V316" stroke="#8c959f" stroke-width="1.6" fill="none" marker-end="url(#a)" stroke-dasharray="4 3"/>
 </svg>
