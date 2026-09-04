@@ -283,6 +283,12 @@ sender addresses and message IDs from your mailbox. They are gitignored.
 **Do not commit them.** Nothing is transmitted anywhere except to Google's own
 API using your credentials.
 
+## Roadmap
+
+A browser-based UI is designed but not built: live scan progress, click-to-select
+review instead of hand-editing `approved.txt`, and a global rate limiter to fix
+sustained throughput. See [docs/DESIGN-UI.md](docs/DESIGN-UI.md).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
