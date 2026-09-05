@@ -22,18 +22,24 @@ terminal, then hand-writes sender addresses into `approved.txt`. It is
 transcription work, it is easy to typo an address into a no-op, and it gives no
 feedback about what the selection actually covers until the dry run.
 
-**Throughput collapses under sustained load.** Measured on a real inbox:
+**Throughput collapsed under sustained load.** Measured on a real inbox.
+**Every figure below is pre-Phase-1** — they describe the per-request-backoff
+behaviour that the shared limiter replaced, not current behaviour:
 
-| Condition | Rate |
-|---|---|
-| Short burst, concurrency 16 | 35.7 msg/s |
-| Short burst, concurrency 12 | ~26 msg/s (projected) |
-| **Sustained over 53 minutes, concurrency 12** | **5.1 msg/s** |
+| Condition | Rate | Status |
+|---|---|---|
+| Short burst, concurrency 16 | 35.7 msg/s | historical |
+| Short burst, concurrency 12 | ~26 msg/s (projected) | historical |
+| **Sustained over 53 minutes, concurrency 12** | **5.1 msg/s** | **historical** |
+| Sustained, post-limiter, concurrency 12 | *not yet measured* | — |
 
 The burst benchmark measured a fresh quota bucket. Sustained, the per-minute
-limit binds continuously and per-request exponential backoff — which climbs to
-60 seconds — idles every worker independently. The tool spends most of its wall
+limit bound continuously and per-request exponential backoff — which climbs to
+60 seconds — idled every worker independently. The tool spent most of its wall
 clock asleep rather than near the quota ceiling.
+
+The post-limiter row is deliberately empty. Fill it from one measured run
+against a real mailbox; do not write in a projected number.
 
 ---
 
@@ -132,25 +138,36 @@ control flow.
 
 ## Performance
 
-### Global rate limiter — the primary fix
+### Global rate limiter — the primary fix (shipped)
 
-Replace per-request exponential backoff with a **single token bucket shared by
-all workers**, sized just under the observed quota ceiling. Today twelve
-workers each discover the limit independently and each sleep up to a minute;
-one coordinated limiter keeps the fleet near the ceiling instead of oscillating
-between over it and asleep.
+Per-request exponential backoff is gone, replaced by a **single token bucket
+shared by all workers** (`RateLimiter`, `LIMITER`). Twelve workers used to
+discover the limit independently and each sleep up to a minute; the shared
+limiter keeps the fleet near the ceiling instead of oscillating between over it
+and asleep.
 
-Make it **adaptive**: ramp until 429s appear, back off, settle. Quota varies by
-project, so a hardcoded constant would be wrong for someone else's setup. The
-current concurrency guidance (12–16) is really a proxy for a rate limit that
-should be enforced directly.
+It is **adaptive**: it ramps until 429s appear, backs off, and settles. Quota
+varies by project, so a hardcoded constant would have been wrong for someone
+else setting this up; `--max-rate` caps the search and `--rate` pins it
+outright. `--concurrency` is now a parallelism knob covering latency, not the
+de-facto rate control it used to be.
 
-### Direct HTTPS instead of subprocess-per-message
+### Direct HTTPS instead of subprocess-per-message — rejected
 
-Each header fetch currently spawns a `gws` process, costing roughly 200ms
-before any network work. Calling the Gmail API directly with `urllib`, using a
-token obtained via `gws`, removes that ceiling and puts every request in one
-process where the shared limiter actually works.
+Each header fetch spawns a `gws` process, costing roughly 200ms before any
+network work. Calling the Gmail API directly with `urllib` would remove that
+ceiling. **Phase 1 deliberately did not do this**, and the decision should not
+be revisited casually:
+
+- `gws auth export` would place a refresh token in this tool memory space,
+  where no credential lives today.
+- Routing around `gws` **bypasses `--sanitize` entirely**, since Model Armor is
+  a `gws` service. That is a safety regression, and it was not obvious until
+  the alternative was written down.
+
+The measured outcome made the trade easy: the shared limiter reaches the
+throughput target *through* the same subprocess path, because subprocess
+overhead was never the binding constraint — uncoordinated sleeping was.
 
 `gws` remains the authentication path — the tool should not reimplement OAuth.
 
@@ -210,14 +227,14 @@ that exists independently of the application's own state.
 
 | Phase | Scope | Notes |
 |---|---|---|
-| 1 | Rate limiter | Independent of the UI; fixes today's pain and speeds all later testing |
+| 1 | Rate limiter | **Shipped.** Independent of the UI; fixed the pain being felt and speeds all later testing |
 | 2 | Server, preflight, scan progress | No deletion path exists yet |
 | 3 | Review table and selection | Replaces `approved.txt` |
 | 4 | Execute and undo | Token and escaping must land *before* this |
 | 5 | Incremental history scans | Makes ongoing use cheap |
 
-The rate limiter leads deliberately. It is the problem actually being felt, it
-carries no UI risk, and every later phase is easier to test when a scan takes
+The rate limiter led deliberately. It was the problem actually being felt, it
+carried no UI risk, and every later phase is easier to test when a scan takes
 minutes instead of an hour.
 
 ---
@@ -231,22 +248,42 @@ Both test suites run offline against fixtures with no Gmail access and no
 quota cost. Develop against those; hitting a real mailbox to test a change
 costs an hour and burns quota you will then be rate-limited by.
 
-### Phase 1 — shared rate limiter
+### Phase 1 — shared rate limiter (shipped)
 
-**Touch:** `gws()` (the `RETRYABLE` retry loop), `cmd_fetch()`, `_safe()`.
+**Touched:** `gws()` (the old `RETRYABLE` retry loop), `cmd_fetch()`,
+`cmd_engaged()`, `_safe()`. `PLAN-RATE-LIMITER.md` carries the full rationale.
 
-Today each worker discovers the quota ceiling independently and sleeps up to
-60s alone. Replace that with one token bucket shared across the pool, sized
-adaptively: ramp until 429s appear, back off, settle. `--concurrency` becomes a
-parallelism knob rather than the de-facto rate control it is now.
+Each worker used to discover the quota ceiling independently and sleep up to
+60s alone. That is now one token bucket shared across the pool: `RateLimiter`
+in GCRA form, so a caller claims a departure deadline under the lock and then
+sleeps alone until its own private instant. Token accrual is a pure function of
+wall time, so no waiter ever wakes to find its slot taken and no thundering
+herd can form. It sizes itself by AIMD — ramp until 429s appear, back off,
+settle.
 
-Keep the existing per-request retry as a backstop for genuinely transient
-failures; the limiter should mean it rarely fires.
+The conflated `RETRYABLE` regex split into `THROTTLE` and `TRANSIENT`, because
+the two failure modes call for opposite responses. A throttle means the *fleet*
+is too fast: shrink the shared rate, re-queue, take no local sleep. A 5xx means
+*this request* failed: keep the per-request backoff and leave the rate alone.
+
+Three guards keep the sawtooth bounded — only raise the rate when the limiter
+is actually binding, hold ~15s after any decrease, and coalesce throttles
+inside a ~2s window into a single decrease. The last is what stops one worker
+429 from tanking the fleet; twelve compounding decreases would give `0.7^12`.
+
+Drops are counted, summarised and written to `fetch-dropped.jsonl` for retry
+rather than scrolling past as stderr noise, and a consecutive-failure circuit
+breaker converts a mid-run token expiry into one clear line instead of 30,000.
 
 **Done when:** a 5,000-message fetch sustains >20 msg/s end-to-end with zero
 dropped messages, and the fetch reports its observed rate. A run that is fast
 but drops messages is a failure, not a partial success — dropped messages
 silently undercount senders.
+
+**Status:** the offline discrete-event simulation settles at 0.75–0.99x a
+simulated ceiling and clears the >20 msg/s bar at ceiling 35
+(`test_fleet_clears_the_twenty_messages_per_second_bar`). The real-mailbox
+measurement that fills the empty table row above has not been run yet.
 
 ### Phase 2 — server, preflight, scan progress
 
@@ -292,17 +329,20 @@ finds new mail, with a documented fallback to a full scan when the stored
 ### Keeping this document honest
 
 The performance figures here are measurements from a specific run, not
-permanent properties. Once Phase 1 lands, "5.1 msg/s sustained" becomes
-historical; mark it as such rather than leaving a future reader to treat it as
-current behaviour.
+permanent properties. Phase 1 has landed, so "5.1 msg/s sustained" is now
+marked historical in the table above. The post-limiter row stays empty until a
+real run fills it — an unmeasured projection sitting in that column would be
+exactly the thing this section exists to prevent.
 
 ## Risks and open questions
 
-**Handling the refresh token.** Direct HTTPS calls require the tool to obtain
-an access token from the credentials `gws` stores. That is a meaningful
-increase in what the tool touches. Falling back to subprocess-per-message keeps
-credentials entirely inside `gws` at a large throughput cost. Worth deciding
-explicitly rather than drifting into.
+**Handling the refresh token — decided: no direct HTTPS.** Direct HTTPS calls
+would require the tool to obtain an access token from the credentials `gws`
+stores. Phase 1 kept subprocess-per-message instead, so credentials stay
+entirely inside `gws` — and, just as importantly, `--sanitize` keeps working,
+since Model Armor is a `gws` service. The throughput cost turned out not to
+exist: the shared limiter hits the target through the subprocess path, because
+uncoordinated sleeping, not process spawn cost, was the binding constraint.
 
 **Quota ceilings vary.** The adaptive limiter must not assume the ceiling
 observed on one project applies to another.

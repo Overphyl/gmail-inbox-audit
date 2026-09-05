@@ -1,6 +1,13 @@
 # Implementation plan: shared adaptive rate limiter
 
-**Status: approved, not yet implemented.** This is Phase 1 of
+**Status: implemented.** Code, tests and documentation have landed; the one
+outstanding item is the measured run against a real mailbox described under
+[Verification](#verification), which needs a live inbox and real quota. The
+post-limiter row in `DESIGN-UI.md` stays empty until then.
+
+This document is kept as written, in the present tense of a proposal, because
+it records *why* each choice was made. Where it says "do not revisit", that
+still holds. This is Phase 1 of
 [`DESIGN-UI.md`](DESIGN-UI.md). That document states *what* and *why*; this one
 states *how*. It is contributor-facing — read `CLAUDE.md` first for the
 invariants, the offline test loop and the platform gotchas.
@@ -455,3 +462,34 @@ surface, no per-launch token and no HTML is written here.
 The one forward commitment is that `FetchProgress.snapshot()` and
 `RateLimiter.stats()` return plain dicts, so a later `/api/progress` can serve
 them in-process without a file.
+
+---
+
+## What shipped, and where it differs from this plan
+
+The implementation follows the plan. Three things are worth recording:
+
+**Test count landed at 33, not the estimated 28.** All 11 original tests pass
+unchanged, including `test_no_permanent_delete_code_path`.
+
+**The herd-property test uses `burst=1`.** With the burst tolerance in place
+the first B reservations all clamp to "now" and are therefore equal, so the
+"12 strictly increasing, distinct deadlines" assertion only means anything
+outside the burst allowance. Burst behaviour is pinned separately by
+`test_limiter_burst_admits_exactly_b`.
+
+**A virtual clock needs a sleeper that advances it.** `acquire()` sleeps in
+slices and re-reads the clock, so a frozen clock plus a no-op sleeper spins
+forever. `_Clock.sleeper` in the test file exists for that; any test that
+exercises `acquire()` rather than `reserve()` must pass it.
+
+The fleet simulation settles at 0.75-0.99x the simulated ceiling, bracketing
+the predicted ~0.80*C. At ceiling 35 it is concurrency-bound rather than
+rate-bound (12 workers / 0.35s = 34 req/s), which is the expected coupling and
+is why `fetch` prints the implied ceiling at startup.
+
+A separate threaded smoke run against a fake transport confirmed the coalescing
+guard under real OS threads: seven simultaneous throttles produced a single
+decrease, 8.0 -> 5.6 req/s, not `8 * 0.7^7`. That is stronger evidence than the
+deterministic tests can give, but it is still not proof of the absence of lock
+convoy under load - as the Tests section says, do not claim more than that.
