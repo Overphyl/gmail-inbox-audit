@@ -75,7 +75,7 @@ npm install -g @googleworkspace/cli
 ```bash
 git clone https://github.com/Overphyl/gmail-inbox-audit.git
 cd gmail-inbox-audit
-python tests/test_audit.py      # optional: 11 offline tests, no API access
+python tests/test_audit.py      # optional: 33 offline tests, no API access
 ```
 
 ### Create a Google Cloud project
@@ -306,7 +306,24 @@ errors="replace"`.
 ## Rate limits
 
 Gmail enforces quota **per minute**, not per second; `messages.get` costs 5
-units. Measured against a ~35,000-message mailbox:
+units.
+
+**The tool paces itself.** A single rate limiter, shared by every worker in the
+process, finds the ceiling by ramping until Gmail starts returning 429s, then
+backing off and settling. You should not normally need to tune anything.
+
+Rate and concurrency are now separate knobs with separate jobs:
+
+- **The limiter governs the rate.** It is what keeps you under quota.
+- **`--concurrency` only covers latency.** A request takes roughly 0.35 s, so
+  sustaining R req/s needs about `R * 0.35` workers in flight. The default of
+  12 supports roughly 34 req/s. `fetch` prints the implied ceiling at startup.
+
+**Never go above 16.** That limit is unchanged and the limiter does not repeal
+it: above ~16 the API drops messages outright, which undercounts senders and
+corrupts the ranking. That is a correctness problem, not a performance one.
+This historical measurement, taken *before* the limiter existed, is where the
+number comes from:
 
 | Concurrency | Throughput | Result |
 |---|---|---|
@@ -315,12 +332,54 @@ units. Measured against a ~35,000-message mailbox:
 | 24 | 34.9 msg/s | clean |
 | 32 | 44.6 msg/s | **27 of 120 dropped** |
 
-Stay at **12–16**. Above that the API drops messages, which undercounts senders
-and corrupts the ranking — a correctness problem, not a performance one. The
-tool retries with exponential backoff, but lowering concurrency is the real fix.
-
 Note that quota is consumed by *any* recent activity, so benchmarking
 immediately before a real run leaves you throttled at the start.
+
+### Flags
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--rate` | `0` (adaptive) | Pin a fixed req/s. Throttles still pause, but never shrink it |
+| `--max-rate` | `40.0` | Ceiling on the adaptive search. Raise it if your project has more quota |
+| `--start-rate` | `8.0` | Initial req/s. Advanced; useful for repeat runs |
+| `--no-rate-limit` | off | Disable pacing entirely. An escape hatch, not a speed-up |
+| `--dropped` | `fetch-dropped.jsonl` | Where unfetchable message IDs are recorded; empty string disables |
+
+### Reading the progress line
+
+```
+  4,213/35,102  12.0%   28.4 msg/s (avg 24.1)  limit 31.0/s ramping     eta 18m12s  drops 0
+```
+
+`limit` is the current shared rate, followed by what the limiter is doing:
+
+| State | Meaning |
+|---|---|
+| `ramping` | Probing upward; the limiter is the binding constraint |
+| `holding` | Not binding — concurrency or Gmail latency is the constraint now |
+| `backoff Ns` | Recently throttled; not probing again for N seconds. Normal |
+| `at-max` | At `--max-rate`. Raise it if you have quota to spare |
+| `pinned` | A fixed `--rate` was given |
+| `FLOOR` | Stuck at the minimum. Something is wrong — see troubleshooting |
+
+`drops` counts messages this run could not fetch, and `thr` appears once any
+throttling has happened. A transient `backoff` is expected and healthy; it is
+how the ceiling gets found.
+
+### Dropped messages
+
+Messages that fail every retry are written to `fetch-dropped.jsonl`, one JSON
+object per line with the ID, a timestamp and a truncated error. The file is
+created only if there is a drop, and re-running the same `fetch` retries them:
+the cache resumes by diffing IDs, so nothing already fetched is re-requested.
+
+It contains real message IDs, so it is gitignored along with `headers.jsonl`.
+Treat it the same way.
+
+**Two processes share one quota.** Running `fetch` and `engaged` at the same
+time gives you two independent limiters searching for one ceiling. They
+converge to a roughly fair split rather than failing, but it looks like the
+ceiling halved with no hint why. Run them one after the other.
 
 Rough timings for ~35,000 messages: listing all IDs ~35 s; full header fetch at
 concurrency 12 about 20–25 minutes.
@@ -408,9 +467,23 @@ Continue with steps 4–7.
 
 ### `Quota exceeded for quota metric 'Total Query Cost'`
 
-You are over Gmail's per-minute quota. Lower `--concurrency` to 12 or below.
-The tool retries with backoff, but sustained over-concurrency drops messages.
+Usually nothing to do. The limiter expects this: it is how the ceiling gets
+found, and the progress line will show `backoff Ns` while it settles. Occasional
+throttling during a long run is normal.
+
+Act only if the state line sits at **`FLOOR`**, which means the limiter has
+been pushed all the way down to its minimum and is staying there. That points
+to a project quota genuinely lower than the tool assumes, or to another process
+spending the same quota. Pin the rate rather than letting it keep searching:
+
+```bash
+python gmail_audit.py fetch --rate 3
+```
+
 Quota is consumed by any recent activity, so wait a minute before retrying.
+Check `--concurrency` is at 16 or below while you are here — the limiter
+governs the rate, but it cannot prevent the message-dropping that happens
+above that.
 
 ### `UnicodeDecodeError: 'charmap' codec can't decode byte`
 

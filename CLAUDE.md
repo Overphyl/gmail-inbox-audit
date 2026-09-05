@@ -55,9 +55,10 @@ human's approved list.
 ```
 gmail_audit.py            the entire tool
 docs/SETUP.md             OAuth setup, troubleshooting, platform notes
-docs/DESIGN-UI.md         proposed web UI (not implemented)
+docs/DESIGN-UI.md         proposed web UI (not implemented; Phase 1 shipped)
+docs/PLAN-RATE-LIMITER.md how the shared rate limiter works, and why
 docs/images/*.svg         hand-authored setup diagrams
-tests/test_audit.py       11 offline tests, no API access needed
+tests/test_audit.py       33 offline tests, no API access needed
 tests/fixtures/           synthetic headers, example.com domains only
 tests/check_diagrams.py   geometric checks on the SVGs
 ```
@@ -66,11 +67,16 @@ tests/check_diagrams.py   geometric checks on the SVGs
 
 | Concern | Symbol |
 |---|---|
-| Subprocess wrapper, retry/backoff | `gws()` |
+| Subprocess wrapper, retry budgets | `gws()` |
+| The only place a subprocess is spawned | `_run()` |
+| Shared adaptive pacing | `RateLimiter`, `LIMITER` |
+| Throttle vs. transient classification | `THROTTLE`, `TRANSIENT`, `_retryable()` |
+| Live counters, drop file, circuit breaker | `FetchProgress`, `PROGRESS` |
+| Progress line and reporter thread | `_progress_line()`, `_progress_reporter()` |
 | Which headers get requested | `HEADERS`, `ENGAGED_HEADERS` |
 | Message ID enumeration | `list_ids()` |
 | Per-message header fetch | `get_headers()`, `_safe()` |
-| Scan loop and concurrency | `cmd_fetch()` |
+| Scan loop and concurrency | `cmd_fetch()`, `_scan()` |
 | Scoring | `score_sender()`, `BULK_MAILERS`, `NOREPLY`, `PROTECTED` |
 | Ranking and safeguards | `cmd_rank()` |
 | Mutation | `_trash_one()`, `cmd_trash()`, `cmd_untrash()` |
@@ -121,12 +127,31 @@ overrides it.
 non-ASCII and Windows' cp1252 default raises `UnicodeDecodeError` mid-fetch.
 
 **Gmail quota is per MINUTE, not per second.** `messages.get` costs 5 units.
-Short bursts reach ~35 msg/s at concurrency 16, but sustained over an hour the
-observed rate collapses to ~5 msg/s, because per-request exponential backoff
-idles each worker independently. Concurrency above ~16 causes the API to drop
-messages outright, which silently undercounts senders and corrupts the ranking.
-This is a correctness problem, not a performance one. See `docs/DESIGN-UI.md`
-for the proposed shared-rate-limiter fix.
+
+*The backoff pathology is fixed.* Sustained scans used to collapse to ~5 msg/s
+because per-request exponential backoff idled each worker independently: twelve
+workers each discovered the ceiling alone and each slept up to 60s without
+telling the others. `RateLimiter` replaced that with one shared, adaptive pacer.
+Do not reintroduce a per-worker `delay` local in `gws()`.
+
+*The concurrency limit is not fixed and is a different problem.* Concurrency
+above ~16 still causes the API to drop messages outright, which silently
+undercounts senders and corrupts the ranking — a correctness problem, not a
+performance one. The limiter governs rate, not parallelism, and does not repeal
+this. The `fetch` default is 12; 16 remains the hard maximum.
+
+Two rules that follow, and that a "simplify" pass will be tempted to break:
+
+- **A throttle and a 5xx are not the same failure.** `THROTTLE` means the fleet
+  is too fast: shrink the shared rate, no local sleep. `TRANSIENT` means one
+  request failed: sleep locally, leave the rate alone. Re-merging them into one
+  `RETRYABLE` regex silently restores the old pathology.
+- **One limiter per process, not per pool.** The quota is per-process-per-user,
+  so `LIMITER` is a module handle like `GWS`. `cmd_fetch` rebuilds its
+  `ThreadPoolExecutor` per batch; per-pool state would re-ramp from the start
+  rate on every batch.
+
+See `docs/PLAN-RATE-LIMITER.md` for the design and the deferred items.
 
 **`file://` URLs are blocked in the browser pane; localhost is not.** To view
 the SVG diagrams, serve them and navigate to `http://localhost:8765/<file>`:

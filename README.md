@@ -97,7 +97,7 @@ Then get the tool:
 ```bash
 git clone https://github.com/Overphyl/gmail-inbox-audit.git
 cd gmail-inbox-audit
-python tests/test_audit.py      # optional: 11 offline tests, no API access
+python tests/test_audit.py      # optional: 33 offline tests, no API access
 ```
 
 ## Setup
@@ -242,7 +242,24 @@ displayed.
 ## Rate limits
 
 Gmail enforces quota **per minute**, not per second. `messages.get` costs 5
-units. Measured against a real 35k mailbox:
+units.
+
+**The tool paces itself.** One rate limiter, shared by every worker, ramps
+until Gmail returns 429s, backs off and settles. The scan prints its current
+rate and state (`ramping`, `backoff 4s`, `at-max`, ...) as it runs. You should
+not normally need to tune anything; `--rate` pins it and `--max-rate` raises
+the ceiling if your project has more quota.
+
+Rate and concurrency are separate knobs now. The limiter governs the rate;
+`--concurrency` only covers request latency, so about `rate * 0.35` workers are
+needed to sustain a given rate.
+
+**Never go above `--concurrency 16`.** Above that the API drops messages, which
+undercounts senders and corrupts the ranking — a correctness problem, not a
+speed one, and one the limiter does not repeal. Messages that cannot be fetched
+are counted and written to `fetch-dropped.jsonl` for retry rather than
+scrolling past. This measurement predates the limiter and is where 16 comes
+from:
 
 | Concurrency | Throughput | Result |
 |---|---|---|
@@ -250,10 +267,6 @@ units. Measured against a real 35k mailbox:
 | 16 | 35.7 msg/s | clean |
 | 24 | 34.9 msg/s | clean |
 | 32 | 44.6 msg/s | **27 of 120 dropped** |
-
-Stay at **12–16**. Above that the API drops messages, which undercounts senders
-and corrupts the ranking — a correctness problem, not a speed one. The tool
-retries with exponential backoff, but dropping concurrency is the real fix.
 
 ## Platform notes
 
@@ -285,9 +298,12 @@ API using your credentials.
 
 ## Roadmap
 
-A browser-based UI is designed but not built: live scan progress, click-to-select
-review instead of hand-editing `approved.txt`, and a global rate limiter to fix
-sustained throughput. See [docs/DESIGN-UI.md](docs/DESIGN-UI.md).
+The global rate limiter has shipped — see Rate limits above. A browser-based UI
+is designed but not built: live scan progress in the browser and click-to-select
+review instead of hand-editing `approved.txt`. See
+[docs/DESIGN-UI.md](docs/DESIGN-UI.md), and
+[docs/PLAN-RATE-LIMITER.md](docs/PLAN-RATE-LIMITER.md) for how the limiter
+works.
 
 ## License
 
