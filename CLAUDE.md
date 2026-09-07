@@ -74,8 +74,8 @@ score. They constrain the *ranking*; they deliberately do not override a
 human's approved list.
 
 **The UI is loopback-only and token-gated.** `http.server` binds `0.0.0.0` by
-default, which would put a scan trigger — and, from phase 4, mail deletion — on
-every interface of the machine. `_ui_bind_address()` *raises* on anything else
+default, which would put a scan trigger — and, if phase 4 is ever built, mail
+deletion — on every interface of the machine. `_ui_bind_address()` *raises* on anything else
 and there is no `--host` flag to reach it with. Every request carries a
 per-launch token, the page included; `Host` and `Origin` are allowlisted, which
 is what defeats DNS rebinding; no CORS header is ever emitted. Four tests cover

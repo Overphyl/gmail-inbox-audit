@@ -282,8 +282,8 @@ It is deliberately small in what it can do:
 It also reports a scan started from a terminal, by reading the same status
 file `gmail_audit.py status` reads, and refuses to start a second one over it.
 
-A review table in the browser is designed but not built, and executing from the
-browser probably should not be — see
+A review table in the browser and executing from the browser are both designed
+but deferred, and deliberately deferred together — see
 [docs/DESIGN-UI.md](docs/DESIGN-UI.md).
 
 ---
@@ -389,10 +389,13 @@ browser, a status file that makes a scan walk-away-able, and the review file
 that removes `approved.txt` transcription.
 
 Next: incremental rescans via the History API, so a repeat audit takes seconds
-rather than an hour. A review table in the browser is optional and would be a
-view over the review file rather than a second selection mechanism; executing
-from the browser is under review and probably not worth the mutating endpoint.
-See [docs/DESIGN-UI.md](docs/DESIGN-UI.md), and
+rather than an hour.
+
+Deferred: a review table in the browser, and executing from the browser. Both
+are designed and neither is blocked; they wait because a browser execute path
+is three layers deep and the selection model has already moved once. Building
+them after the tool's shape settles costs no more and should need far fewer
+full-stack passes. See [docs/DESIGN-UI.md](docs/DESIGN-UI.md), and
 [docs/PLAN-RATE-LIMITER.md](docs/PLAN-RATE-LIMITER.md) for how the limiter
 works.
 

@@ -1,7 +1,7 @@
 # Design: local web UI
 
-**Status: phases 1, 2 and the goal of 3 have shipped; 4 and 5 are open, and
-4's case is now weaker than it was.** The rate limiter, the localhost server
+**Status: phases 1, 2 and the goal of 3 have shipped; 5 is next and 4 is
+deferred until the tool's shape settles.** The rate limiter, the localhost server
 and the review file all exist. Selection no longer requires transcription, but
 it happens in a file rather than in the browser - see **Phase 3, reassessed**
 below for why that turned out to be the better artifact, and what it does to
@@ -118,8 +118,8 @@ model.
 | POST | `/api/scan` | start or resume a scan | shipped |
 | GET | `/api/senders` | ranked index with scores, signals, safeguards | phase 3, optional |
 | POST | `/api/selection` | persist the approved set | superseded by the review file |
-| POST | `/api/trash` | execute, token + explicit confirmation required | phase 4, under review |
-| POST | `/api/untrash` | restore from manifest | phase 4, under review |
+| POST | `/api/trash` | execute, token + explicit confirmation required | phase 4, deferred |
+| POST | `/api/untrash` | restore from manifest | phase 4, deferred |
 
 `test_ui_exposes_no_mutating_route` asserts the bottom four are absent. A phase
 that adds one is expected to update that test deliberately, which is the
@@ -257,11 +257,11 @@ badges. Checkboxes replace `approved.txt`. Bulk selection by predicate ("all
 scoring ≥ 8 with no safeguard"). Per-sender expander showing message dates and
 truncated subjects.
 
-**4. Confirm.** *Shipped in the CLI; phase 4 in the browser is under
-review.* Exact per-sender counts. Safeguarded senders listed separately
+**4. Confirm.** *Shipped in the CLI; deferred in the browser.* Exact
+per-sender counts. Safeguarded senders listed separately
 and requiring individual override — never swept along by a bulk select.
 
-**5. Execute and undo.** *Under review; see phase 4.* Progress, then a
+**5. Execute and undo.** *Deferred; see phase 4.* Progress, then a
 persistent Undo backed by the manifest.
 
 ---
@@ -295,7 +295,7 @@ record now: it is the input, so it cannot drift from what was actually done.
 | 2.5 | Status file, `status` subcommand | **Shipped.** Not originally a phase. A scan you cannot walk away from is barely usable, and the UI could only see its own scans |
 | 3 | Selection without transcription | **Shipped as a file, not a table.** `rank --review` / `trash --review`. See below |
 | 3b | Review table in the browser | Optional. A better *view* over the review file; no longer on the critical path |
-| 4 | Execute and undo in the browser | **Under review.** Its main justification was that selection lived in the browser. It no longer does |
+| 4 | Execute and undo in the browser | **Deferred.** Not blocked and not declined: it is three layers deep, and the selection model has already moved once. Decide it with 3b |
 | 5 | Incremental history scans | Open. Makes ongoing use cheap, and is now the highest-value remaining item |
 
 The rate limiter led deliberately. It was the problem actually being felt, it
@@ -474,25 +474,55 @@ selection mechanism with its own state. This is where sender-chosen text and
 `Subject` first reach a browser, so the escaping discipline from phase 2 starts
 being load-bearing rather than precautionary.
 
-### Phase 4 — execute and undo in the browser (under review)
+### Phase 4 — execute and undo in the browser (deferred)
 
 **Touch:** `cmd_trash()`, `cmd_untrash()`, `_trash_one()`.
 
-The token check and output escaping landed in phase 2, as required, so nothing
-blocks this. The question is whether it should be built at all.
+**Deferred, not declined.** Nothing blocks it: the token check and the output
+escaping landed in phase 2, as required. It is deferred because it is not worth
+building against a tool whose shape is still moving.
 
 Its original case was that selection happened in the browser, so execution
 should finish there rather than sending the user back to a terminal, and that
 Undo needed to be prominent rather than buried. Selection no longer happens in
-the browser, and `untrash --manifest` already exists. What remains is a
-mutating endpoint - the single largest new risk in this entire design - in
-exchange for not typing one command.
+the browser, and `untrash --manifest` already exists, so the first half of that
+case is gone and the second is partly covered - `cmd_trash` prints the exact
+undo command when it finishes.
 
-**Recommendation: do not build it, or build it last.** Declining it removes the
-deletion capability from the browser permanently, which turns
-`test_ui_exposes_no_mutating_route` from a phase boundary into a standing
-invariant. That is a better end state than the one this document originally
-planned. Phase 5 is worth more.
+**The reason to wait is iteration cost, not risk.** A browser execute path is
+three layers deep: `cmd_trash`, an endpoint, and a page. Every change to the
+selection model or the confirm semantics has to be made in all three. Phase 3
+already moved once, from a table to a file, and the review file has not yet
+been used against a real mailbox even once. Building the UI after the model
+settles costs no more than building it now and should need far fewer
+full-stack passes.
+
+**Two arguments recorded honestly, because the case is not one-sided.**
+
+*Against building it, weaker than an earlier draft of this section claimed.*
+That draft called the mutating endpoint "the single largest new risk in this
+design" and left it there. That phrase was written about a different tier of
+risk. The capability in question is `messages.trash`, on a tool that writes a
+complete manifest before mutating and holds a scope under which permanent
+deletion is impossible. The worst case is mail in Trash with an undo list on
+disk and thirty days to use it: bad, not catastrophic. Compare the absences
+that phrasing was built for - no `messages.delete` in the source, `gmail.modify`
+rather than `mail.google.com/` - which prevent *irreversible* loss. Same shape,
+different stakes. Do not reuse the stronger wording for the weaker case.
+
+*For building it, underweighted in that same draft.* A confirm screen with
+exact per-sender counts and safeguarded senders listed separately reads better
+than terminal output that scrolls, and a visible Undo button beats recalling a
+command for someone who has just trashed eight thousand messages and is
+alarmed. That is precisely the moment interface quality matters most.
+
+**Decide it together with phase 3b, not separately.** Building 3b without 4
+produces the exact seam the original design set out to avoid: select in the
+browser, then switch to a terminal to execute. The coherent options are
+*neither* - the browser stays read-only and the review file remains the
+decision surface - or *both*, with the escaping discipline and the mutating
+endpoint arriving together as originally planned. "3b but not 4" is the one
+combination that makes no sense.
 
 **Done when (if built):** a trash run through the UI writes the same manifest
 the CLI writes, Undo restores from it, and tests assert that a request without
