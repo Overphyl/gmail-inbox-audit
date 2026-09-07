@@ -97,7 +97,7 @@ Then get the tool:
 ```bash
 git clone https://github.com/Overphyl/gmail-inbox-audit.git
 cd gmail-inbox-audit
-python tests/test_audit.py      # optional: 33 offline tests, no API access
+python tests/test_audit.py      # optional: 51 offline tests, no API access
 ```
 
 ## Setup
@@ -139,6 +139,13 @@ gws gmail users getProfile --params '{"userId":"me"}'
 ---
 
 ## Usage
+
+The CLI below is the reference path. `python gmail_audit.py ui` puts steps 1
+and 3 in a browser instead — an auth preflight that catches the scope trap
+before you wait an hour for a scan that cannot work, and live scan progress
+with the observed rate and rate-limit state. It reads and writes the same
+cache, so you can mix the two freely. **It cannot trash anything**; reviewing
+and trashing stay in the CLI until later phases land.
 
 ### 1. Baseline
 
@@ -201,6 +208,36 @@ python gmail_audit.py untrash --manifest trashed-manifest.jsonl --execute
 ```
 
 Or empty Gmail's Trash yourself after 30 days if you're satisfied.
+
+---
+
+## The local UI
+
+```bash
+python gmail_audit.py ui
+```
+
+Opens a browser on `http://127.0.0.1:8765`. Two panels: **preflight**, which
+makes a real `getProfile` call and tells you whether you are unauthenticated or
+authenticated-without-the-Gmail-scope — a distinction `gws auth status` gets
+wrong; and **scan**, which runs the same `fetch` you would run from the CLI and
+shows fetched/total, msg/s, ETA from observed throughput, drops, and what the
+rate limiter is doing (`ramping`, `backoff 12s`, `at-max`).
+
+It is deliberately small in what it can do:
+
+- **Loopback only.** The bind address is asserted, not defaulted, and there is
+  no flag to change it.
+- **Token-gated.** A random token is generated per launch, carried in the URL
+  the tool opens, never written to disk, and required on every request — the
+  page included. `Host` and `Origin` are checked too, which is what stops DNS
+  rebinding, and no CORS header is ever sent.
+- **No deletion path.** There is no trash endpoint to reach. The security
+  machinery above landed first, on a surface that cannot delete anything, so
+  it is not the deletion path's first draft that gets tested.
+
+Ranking, selection and execute-with-undo are designed but not built — see
+[docs/DESIGN-UI.md](docs/DESIGN-UI.md).
 
 ---
 
@@ -288,6 +325,8 @@ Restart the shell, or the tool will look missing when it isn't.
 - Permanently delete anything
 - Act without an explicit approved-sender list
 - Score based on `Subject`
+- Listen on anything but loopback, or serve a request without the per-launch
+  token
 
 ## Privacy
 
@@ -298,9 +337,12 @@ API using your credentials.
 
 ## Roadmap
 
-The global rate limiter has shipped — see Rate limits above. A browser-based UI
-is designed but not built: live scan progress in the browser and click-to-select
-review instead of hand-editing `approved.txt`. See
+Shipped: the global rate limiter (see Rate limits above) and the first half of
+the browser UI — preflight and live scan progress.
+
+Next: click-to-select review instead of hand-editing `approved.txt`, then
+execute-and-undo in the browser, then incremental rescans via the History API
+so a repeat audit takes seconds rather than an hour. See
 [docs/DESIGN-UI.md](docs/DESIGN-UI.md), and
 [docs/PLAN-RATE-LIMITER.md](docs/PLAN-RATE-LIMITER.md) for how the limiter
 works.

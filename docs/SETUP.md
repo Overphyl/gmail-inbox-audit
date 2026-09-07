@@ -253,6 +253,10 @@ gws gmail users getProfile --params '{\"userId\":\"me\"}'
 Success returns your address and message totals. A 403
 `insufficientPermissions` means the grant is wrong — revisit steps 5 and 8.
 
+`python gmail_audit.py ui` makes the same call from a browser panel and names
+which of the two failures you have, which is worth doing once here rather than
+discovering it an hour into a scan.
+
 ---
 
 ## Scope choice

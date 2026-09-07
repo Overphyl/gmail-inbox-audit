@@ -10,7 +10,9 @@ spam signals, and bulk-trashes senders the user has explicitly approved. Python
 to the `gws` CLI for Gmail API access.
 
 Everything lives in one module, `gmail_audit.py`, with subcommands: `baseline`,
-`fetch`, `engaged`, `rank`, `trash`, `untrash`.
+`fetch`, `engaged`, `rank`, `trash`, `untrash`, `ui`. The `ui` subcommand
+serves a localhost page with an auth preflight and live scan progress; it is
+phase 2 of `docs/DESIGN-UI.md` and has no mutating endpoint.
 
 ## Hard rules
 
@@ -50,6 +52,29 @@ protected domain, or starred/important are forced to `Review` regardless of
 score. They constrain the *ranking*; they deliberately do not override a
 human's approved list.
 
+**The UI is loopback-only and token-gated.** `http.server` binds `0.0.0.0` by
+default, which would put a scan trigger — and, from phase 4, mail deletion — on
+every interface of the machine. `_ui_bind_address()` *raises* on anything else
+and there is no `--host` flag to reach it with. Every request carries a
+per-launch token, the page included; `Host` and `Origin` are allowlisted, which
+is what defeats DNS rebinding; no CORS header is ever emitted. Four tests cover
+this. Do not add a convenience flag to any of it.
+
+**The UI page never writes markup.** Every dynamic value goes in through one
+`textContent` helper. `test_ui_page_never_writes_markup` fails on the literal
+strings `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`,
+`eval(` and `new Function` appearing anywhere in `UI_HTML` — including in a
+comment, which is how it will first bite you. Phase 3 renders sender-chosen
+text on a page that holds a deletion-capable token; the discipline exists now
+so it is not being invented then. The page also loads nothing from any external
+origin, which is what lets its `Content-Security-Policy` be `default-src
+'none'`.
+
+**The UI does not fork the scan.** `/api/scan` calls `cmd_fetch()` itself. That
+is what keeps the cache, resumability, drop accounting, circuit breaker and
+reconciliation identical between the two front ends. Do not write a second
+scan loop for the UI.
+
 ## Layout
 
 ```
@@ -58,7 +83,7 @@ docs/SETUP.md             OAuth setup, troubleshooting, platform notes
 docs/DESIGN-UI.md         proposed web UI (not implemented; Phase 1 shipped)
 docs/PLAN-RATE-LIMITER.md how the shared rate limiter works, and why
 docs/images/*.svg         hand-authored setup diagrams
-tests/test_audit.py       33 offline tests, no API access needed
+tests/test_audit.py       51 offline tests, no API access needed
 tests/fixtures/           synthetic headers, example.com domains only
 tests/check_diagrams.py   geometric checks on the SVGs
 ```
@@ -80,6 +105,10 @@ tests/check_diagrams.py   geometric checks on the SVGs
 | Scoring | `score_sender()`, `BULK_MAILERS`, `NOREPLY`, `PROTECTED` |
 | Ranking and safeguards | `cmd_rank()` |
 | Mutation | `_trash_one()`, `cmd_trash()`, `cmd_untrash()` |
+| Auth preflight and its error classification | `preflight()`, `classify_gws_error()`, `UI_ERRORS`, `UI_HINTS` |
+| UI server, bind guard, request guards, routing | `make_ui_server()`, `_ui_bind_address()`, `_UIHandler` |
+| Scan lifecycle behind the UI | `ScanState`, `_ui_run_scan()`, `cmd_ui()` |
+| The served page (inlined CSS and JS) | `UI_HTML` |
 
 ## Verifying changes
 
@@ -99,6 +128,13 @@ regressions fail loudly.
 When adding a signal or safeguard, add a fixture sender that exercises it. A
 test that only passes because the fixture lacks the case is worse than none:
 the `To`/`Cc` bug below shipped precisely because the fixture bypassed the API.
+
+The `ui` subcommand has the same problem the diagrams do. The `test_ui_*` tests
+speak real HTTP to a real loopback socket, so the guards are genuinely covered,
+but nothing there can tell you a panel wraps badly or a number is unreadable.
+Stub `_run` with a fake mailbox, serve it, and *look at the page* before
+claiming a UI change is right. Two layout bugs in phase 2 were invisible to a
+green suite and obvious in one screenshot.
 
 ## Privacy
 
