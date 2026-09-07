@@ -159,6 +159,12 @@ python tests/test_audit.py
 python tests/check_diagrams.py
 ```
 
+CI runs both on every push and PR (`.github/workflows/tests.yml`): Python 3.9,
+3.11 and 3.13 on Linux, 3.8 in a container because the runner images no longer
+carry it, and one Windows job. The Windows job is not ceremony - the `.cmd`
+shim, forced UTF-8 decoding, `os.replace` and the `os.kill` trap are all
+Windows-specific, and it is the only place any of them is exercised.
+
 `tests/fixtures/headers.jsonl` is synthetic and uses `example.com` domains
 only. It deliberately includes senders that score in Trash range but must be
 demoted — a bank, a replied-to vendor, a starred sender — so safeguard

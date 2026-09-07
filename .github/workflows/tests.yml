@@ -1,0 +1,59 @@
+# Both suites are standard-library only and touch no network, so there is
+# nothing to install, no cache to warm and no secret to expose. That is the
+# same property that makes them the development loop rather than a real
+# mailbox: see CLAUDE.md, "Verifying changes".
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-suites:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.11", "3.13"]
+    name: python ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python tests/test_audit.py
+      - run: python tests/check_diagrams.py
+
+  floor:
+    # The README promises 3.8+, so something has to hold that claim up.
+    # In a container rather than on a runner image: 3.8 is gone from
+    # ubuntu-latest, and ubuntu-22.04 - the image that still carries it -
+    # begins deprecation in September 2026 and is unsupported from April 2027.
+    # Pinning that label would be shipping a job with an expiry date.
+    runs-on: ubuntu-latest
+    container: python:3.8-slim
+    name: python 3.8 (floor)
+    steps:
+      - uses: actions/checkout@v4
+      - run: python tests/test_audit.py
+      - run: python tests/check_diagrams.py
+
+  windows:
+    # This tool carries a lot of Windows-specific handling - the gws .cmd
+    # shim, forced UTF-8 decoding against a cp1252 default, os.replace for the
+    # status and review files, and the os.kill/TerminateProcess trap the
+    # status file exists to avoid. The offline suites are the only place any
+    # of it is exercised at all.
+    runs-on: windows-latest
+    name: windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python tests/test_audit.py
+      - run: python tests/check_diagrams.py
