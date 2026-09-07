@@ -9,6 +9,9 @@
 headers.jsonl
 engaged.txt
 approved.txt
+review.txt
+*-status.json
+*.tmp
 *manifest*.jsonl
 run.log
 *.log

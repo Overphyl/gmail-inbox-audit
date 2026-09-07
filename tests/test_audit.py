@@ -5,8 +5,10 @@ These are offline: they exercise scoring, safeguards and the structural safety
 properties without touching the Gmail API.
 """
 import argparse
+import ast
 import collections
 import contextlib
+import fnmatch
 import heapq
 import http.client
 import io
@@ -27,35 +29,13 @@ SOURCE = os.path.join(os.path.dirname(__file__), "..", "gmail_audit.py")
 
 
 def _rows(engaged=()):
-    """Rank the fixture and return {sender: row}."""
-    msgs = g.load_cache(FIXTURE)
-    by_sender = {}
-    for m in msgs:
-        by_sender.setdefault(g.addr_of(m["headers"].get("from", "")), []).append(m)
+    """Rank the fixture and return {sender: row}.
 
-    out = {}
-    for sender, group in by_sender.items():
-        group.sort(key=lambda m: int(m.get("internalDate") or 0))
-        score, signals = g.score_sender(sender, group)
-        guard = None
-        if sender in engaged:
-            guard = "replied-to"
-        elif any(p in sender for p in g.PROTECTED):
-            guard = "protected-domain"
-        elif any("STARRED" in m["labelIds"] or "IMPORTANT" in m["labelIds"]
-                 for m in group):
-            guard = "starred/important"
-        if guard:
-            rec = "Review"
-        elif score >= 6:
-            rec = "Trash"
-        elif score >= 3:
-            rec = "Review"
-        else:
-            rec = "Keep"
-        out[sender] = {"score": score, "rec": rec, "guard": guard,
-                       "signals": signals, "count": len(group)}
-    return out
+    Through rank_rows, deliberately: this helper used to reimplement the
+    scoring and safeguard logic, so the safeguard tests could pass against a
+    copy while the real ranking regressed.
+    """
+    return {r["sender"]: r for r in g.rank_rows(g.load_cache(FIXTURE), engaged)}
 
 
 # ------------------------------------------------------------------ scoring
@@ -604,6 +584,327 @@ def test_consecutive_failures_trip_the_circuit_breaker():
     raise AssertionError("cmd_fetch should abort after consecutive failures")
 
 
+# ------------------------------------------------------------------ status
+def _gitignored(name):
+    """True if some .gitignore rule matches this filename.
+
+    Matched rather than looked up literally: a rename that escapes the rules
+    is exactly the failure this guards against, and a rule the file no longer
+    matches would still be present in the list.
+    """
+    path = os.path.join(os.path.dirname(SOURCE), ".gitignore")
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("!"):
+                continue
+            if fnmatch.fnmatch(name, line.rstrip("/")):
+                return True
+    return False
+
+
+def test_status_file_carries_a_scan_across_processes():
+    """The scan dies with its shell. Without this file, "how far along is the
+    run in that other window?" has no answer at all."""
+    ids = ["a1", "b2", "c3", "d4"]
+    with tempfile.TemporaryDirectory() as d:
+        a = _fetch_args(d, ids, status=os.path.join(d, "fetch-status.json"))
+        _run_fetch(a, _FakeTransport(ids))
+
+        st = g.read_status(a.status)
+        assert st, "no status file was written"
+        # The terminal state: a reader after the fact must see an outcome,
+        # not a run that looks stalled forever.
+        assert st["state"] == "done", st
+        assert st["command"] == "fetch"
+        assert st["done"] == 4 and st["total"] == 4 and st["dropped"] == 0
+        assert st["query"] == "in:inbox"
+        assert st["stale"] is False
+        # No addresses and no message IDs: the query is the only mailbox-shaped
+        # value in here, and it is why the file is gitignored.
+        blob = json.dumps(st)
+        assert "@" not in blob, blob
+        for i in ids:
+            assert i not in blob, i
+
+
+def test_status_file_reports_a_killed_scan_as_stale():
+    """A killed scan leaves state 'running' behind forever. mtime is what
+    separates "still going" from "the process is gone"."""
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "fetch-status.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"command": "fetch", "state": "running", "done": 120,
+                       "total": 300, "rate": 22.3, "eta": 8.0}, f)
+        assert g.read_status(p)["stale"] is False, "fresh file is not stale"
+
+        old = time.time() - (g.STATUS_STALE_AFTER + 30)
+        os.utime(p, (old, old))
+        st = g.read_status(p)
+        assert st["stale"] is True, st
+        # A rate from a process that no longer exists reads as live throughput.
+        line = " ".join(g._status_lines(st))
+        assert "STALE" in line and "22.3" not in line, line
+        assert "resume" in line, line
+
+
+def test_status_never_probes_the_pid():
+    """os.kill(pid, 0) is the usual liveness idiom and a trap here: on Windows
+    os.kill ignores the signal and calls TerminateProcess, so the line that
+    asks whether the scan is alive would kill it.
+
+    Over the parsed tree, not the text: the comment that explains the trap
+    names the call, and banning the string would ban the explanation.
+    """
+    tree = ast.parse(open(SOURCE, encoding="utf-8").read())
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        name = getattr(fn, "attr", None) or getattr(fn, "id", None)
+        assert name not in ("kill", "terminate"), ast.dump(fn)
+
+
+def test_status_writing_never_fails_a_scan():
+    """Telemetry. A scan that dies because its status file was unwritable
+    would be a worse bug than having no status file."""
+    ids = ["a1", "b2", "c3"]
+    with tempfile.TemporaryDirectory() as d:
+        # A directory where the file should be: every write raises.
+        blocked = os.path.join(d, "blocked")
+        os.mkdir(blocked)
+        a = _fetch_args(d, ids, status=blocked)
+        _run_fetch(a, _FakeTransport(ids))
+        assert len(g.load_cache(a.cache)) == 3, "the scan must still finish"
+
+
+def test_status_and_review_files_are_gitignored():
+    """They hold sender addresses and mailbox queries - the same class of data
+    as headers.jsonl."""
+    for name in (g.FETCH_STATUS, g.ENGAGED_STATUS, g.REVIEW_FILE,
+                 g.REVIEW_FILE + ".tmp", g.FETCH_STATUS + ".tmp"):
+        assert _gitignored(name), name
+
+
+def test_ui_reports_a_scan_started_in_another_terminal():
+    """The CLI is the reference path, so a scan is at least as likely to have
+    been started from a terminal as from the page."""
+    orig_progress = g.PROGRESS
+    try:
+        g.PROGRESS = None
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "fetch-status.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"command": "fetch", "state": "running", "done": 900,
+                           "total": 35012, "dropped": 2, "rate": 27.6,
+                           "avg_rate": 24.0, "eta": 1400.0,
+                           "query": "in:inbox"}, f)
+            args = argparse.Namespace(sanitize=None, cache="headers.jsonl",
+                                      batch=1000, dropped="", status=p)
+            with _ui_server(args) as (_, port, token):
+                code, _, body = _ui_req(port, "GET", "/api/progress",
+                                        token=token)
+        d2 = json.loads(body)
+    finally:
+        g.PROGRESS = orig_progress
+    assert code == 200, code
+    assert d2["scan"]["source"] == "file", d2["scan"]
+    assert d2["scan"]["phase"] == "running", d2["scan"]
+    assert d2["progress"]["done"] == 900 and d2["progress"]["total"] == 35012
+
+
+# ------------------------------------------------------------------ review
+def _review_rows(engaged=()):
+    return g.rank_rows(g.load_cache(FIXTURE), engaged)
+
+
+def _marks(path):
+    marks, errors = g.parse_review(path, strict=True)
+    assert not errors, errors
+    return marks
+
+
+def test_review_file_starts_completely_unmarked():
+    """The friction being removed is partly protective. A file that arrives
+    pre-marked and needs only a save is more dangerous than typing the
+    addresses out."""
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "review.txt")
+        summary = g.write_review(p, _review_rows())
+        assert summary["marked"] == 0, summary
+        assert set(_marks(p).values()) == {False}
+
+
+def test_preselect_never_marks_a_safeguarded_sender():
+    """--preselect-score is the bulk select. It must not be able to sweep a
+    protected sender along, at any threshold."""
+    rows = _review_rows(engaged={"newsletter@vendor.example.org"})
+    guarded = {r["sender"] for r in rows if r["guard"]}
+    assert guarded, "the fixture must contain safeguarded senders"
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "review.txt")
+        g.write_review(p, rows, preselect_score=1)  # mark everything it can
+        marks = _marks(p)
+        for sender in guarded:
+            assert marks[sender] is False, sender
+        assert any(marks.values()), "it should still mark the unguarded ones"
+
+
+def test_review_and_senders_file_produce_the_same_targets():
+    """DESIGN-UI.md's phase 3 done-when, one layer down: selection through the
+    new artifact must equal the set the old one would act on."""
+    chosen = ["news@deals.example.com", "no-reply@sketchy.example.net"]
+    with tempfile.TemporaryDirectory() as d:
+        review = os.path.join(d, "review.txt")
+        g.write_review(review, _review_rows())
+        lines = open(review, encoding="utf-8").read().splitlines()
+        with open(review, "w", encoding="utf-8") as f:
+            for l in lines:
+                f.write(("t" + l[1:] if any(c in l for c in chosen) else l) + "\n")
+
+        senders = os.path.join(d, "approved.txt")
+        with open(senders, "w", encoding="utf-8") as f:
+            f.write("\n".join(chosen) + "\n")
+
+        via_review = _dry_run_targets(d, review=review)
+        via_senders = _dry_run_targets(d, senders=senders)
+    assert via_review == via_senders, (len(via_review), len(via_senders))
+    assert via_review, "the fixture should match something"
+
+
+def _dry_run_targets(d, review=None, senders=None):
+    """Run cmd_trash as a dry run and return the manifest's message IDs."""
+    manifest = os.path.join(d, "m-{}.jsonl".format("r" if review else "s"))
+    a = argparse.Namespace(
+        sanitize=None, review=review, senders=senders or "approved.txt",
+        engaged="", cache=FIXTURE, manifest=manifest, batch=250,
+        concurrency=2, execute=False, yes=True,
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        g.cmd_trash(a)
+    return {json.loads(l)["id"] for l in open(manifest, encoding="utf-8")
+            if l.strip()}
+
+
+def test_review_regeneration_carries_marks_forward():
+    """Review in several sittings, or fetch more mail part way through, and
+    the decisions already made must survive. Silently discarding a
+    half-finished review is worse than anything overwriting would prevent."""
+    rows = _review_rows()
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "review.txt")
+        g.write_review(p, rows)
+        lines = open(p, encoding="utf-8").read().splitlines()
+        with open(p, "w", encoding="utf-8") as f:
+            for l in lines:
+                f.write(("t" + l[1:] if "news@deals" in l else l) + "\n")
+
+        # Re-rank over a cache that has grown by one sender.
+        extra = dict(rows[0], sender="brand-new@example.com", count=1,
+                     score=0, signals=[], guard=None, rec="Keep")
+        summary = g.write_review(p, rows + [extra])
+        marks = _marks(p)
+    assert marks["news@deals.example.com"] is True, "the mark was lost"
+    assert marks["brand-new@example.com"] is False, "new senders start unmarked"
+    assert summary["carried"] == len(rows) and summary["kept_marked"] == 1
+
+
+def test_review_parse_errors_name_the_line():
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "review.txt")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("# header\n"
+                    "t     news@deals.example.com\n"
+                    "t     news@deals\n"                  # not an address
+                    "X     other@example.com\n"           # unknown mark
+                    "t     news@deals.example.com\n")     # duplicate
+        marks, errors = g.parse_review(p, strict=True)
+    assert len(errors) == 3, errors
+    joined = " | ".join(errors)
+    assert "line 3" in joined and "line 4" in joined and "line 5" in joined
+    assert "is not an address" in joined and "already appears" in joined
+
+
+def test_a_typo_that_is_still_a_valid_address_is_refused_not_skipped():
+    """The failure mode the format exists to remove. A transposed domain is
+    syntactically valid, so no parser can catch it; in approved.txt it simply
+    matches nothing and quietly does less than asked. The review file is
+    generated from the cache, which is what makes "matches nothing" a
+    detectable contradiction rather than a plausible line."""
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "review.txt")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("t   news@deals.example.com\n"
+                    "t   news@deals.exmaple.com\n")   # transposed, valid
+        marks, errors = g.parse_review(p, strict=True)
+        assert not errors, "syntactically fine - the parser cannot help here"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                _dry_run_targets(d, review=p)
+        except SystemExit as e:
+            assert "exmaple" in str(e) and "typo" in str(e), e
+            return
+    raise AssertionError("a marked sender matching nothing must stop the run")
+
+
+def test_review_parser_tolerates_hand_editing():
+    """Split on whitespace, so re-aligning or reordering rows by hand is fine
+    and only the mark and the address carry meaning."""
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "review.txt")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("t news@deals.example.com\n"
+                    "\n"
+                    ".\t\t[!]   alerts@mybank.example.com   30  8  whatever\n"
+                    "t   [!] promo@shop.example.com\n")
+        marks, errors = g.parse_review(p, strict=True)
+    assert not errors, errors
+    assert marks == {"news@deals.example.com": True,
+                     "alerts@mybank.example.com": False,
+                     "promo@shop.example.com": True}
+
+
+def test_trash_recomputes_the_safeguard_rather_than_trusting_the_file():
+    """Deleting the [!] flag by hand removes the marker, not the warning."""
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "review.txt")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("t   alerts@mybank.example.com\n")   # no [!] anywhere
+        out = io.StringIO()
+        a = argparse.Namespace(
+            sanitize=None, review=p, senders="approved.txt", engaged="",
+            cache=FIXTURE, manifest=os.path.join(d, "m.jsonl"), batch=250,
+            concurrency=2, execute=False, yes=True,
+        )
+        with contextlib.redirect_stdout(out):
+            g.cmd_trash(a)
+    text = out.getvalue()
+    assert "SAFEGUARD OVERRIDE" in text, text
+    assert "protected-domain" in text, text
+
+
+def test_rank_rows_is_the_single_ranking():
+    """The table, the JSON and the review file are three renderings of one
+    ranking, not three rankings kept in agreement by hand."""
+    rows = _review_rows()
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "review.txt")
+        g.write_review(p, rows)
+        marks = _marks(p)
+    assert set(marks) == {r["sender"] for r in rows}
+    # ...and the file lists them in the ranking's own order, so the rows that
+    # most want a decision are the ones at the top.
+    with tempfile.TemporaryDirectory() as d2:
+        p2 = os.path.join(d2, "review.txt")
+        g.write_review(p2, rows)
+        listed = [l.split()[-0 or 0] and l.split() for l in
+                  open(p2, encoding="utf-8").read().splitlines()
+                  if l and not l.startswith("#")]
+    senders = [parts[1] if parts[1] != g.REVIEW_GUARD_FLAG else parts[2]
+               for parts in listed]
+    assert senders == [r["sender"] for r in rows], senders
+
+
 # ------------------------------------------------------------------- web ui
 # A localhost server that will one day trash mail is a materially different
 # risk profile from a CLI, so these are safety tests, not smoke tests. They
@@ -798,6 +1099,31 @@ def test_ui_page_never_writes_markup():
     assert "http://" not in g.UI_HTML and "https://" not in g.UI_HTML
 
 
+def test_ui_refuses_to_start_a_scan_over_one_running_elsewhere():
+    """It shares this mailbox's quota and this cache. The button is disabled
+    for it, but the guard has to be on the server: the page is not the only
+    thing that can post to that endpoint."""
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "fetch-status.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"command": "fetch", "state": "running", "done": 900,
+                       "total": 35012, "pid": 4242}, f)
+        args = argparse.Namespace(sanitize=None, cache="headers.jsonl",
+                                  batch=1000, dropped="", status=p)
+        with _ui_server(args) as (httpd, port, token):
+            code, _, body = _ui_req(port, "POST", "/api/scan", token=token,
+                                    body={"concurrency": 4})
+            assert code == 409, code
+            assert "4242" in json.loads(body)["error"], body
+            assert httpd.ui_scan.snapshot()["status"] == "idle"
+
+            # ...but a scan that died does not block one forever.
+            old = time.time() - (g.STATUS_STALE_AFTER + 30)
+            os.utime(p, (old, old))
+            code, _, body = _ui_req(port, "GET", "/api/progress", token=token)
+            assert json.loads(body)["scan"]["phase"] == "stale", body
+            assert json.loads(body)["limiter"] is None, "a dead run has no pace"
+
 # ---------------------------------------------------------------- preflight
 def test_preflight_distinguishes_missing_scope_from_missing_auth():
     """The trap this screen exists for. `gws auth status` reports REQUESTED
@@ -899,6 +1225,10 @@ def test_ui_scan_runs_the_very_same_fetch_path():
             cached = {m["id"] for m in g.load_cache(args.cache)}
             assert cached == set(ids), cached
             assert not os.path.exists(args.dropped), "clean run, no drop file"
+        # A namespace with no --status means disabled. A default guessed here
+        # would write a status file into whatever directory the tests ran in.
+        assert not os.path.exists(g.FETCH_STATUS), (
+            "the suite must not write into the project directory")
     finally:
         g._run, g.LIMITER, g.PROGRESS = orig_run, orig_limiter, orig_progress
 

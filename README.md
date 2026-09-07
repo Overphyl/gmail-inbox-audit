@@ -97,7 +97,7 @@ Then get the tool:
 ```bash
 git clone https://github.com/Overphyl/gmail-inbox-audit.git
 cd gmail-inbox-audit
-python tests/test_audit.py      # optional: 51 offline tests, no API access
+python tests/test_audit.py      # optional: 67 offline tests, no API access
 ```
 
 ## Setup
@@ -181,21 +181,46 @@ Oldest-first, resumable — re-running skips what is already cached. Roughly
 python gmail_audit.py rank
 ```
 
-### 5. Review, then approve
+### 5. Review
 
-Read the ranked index and write the senders you want gone, one per line:
+```bash
+python gmail_audit.py rank --review review.txt
+```
+
+The ranked index and the approval list are the same file, so there is nothing
+to transcribe. Every row arrives **unmarked**; change the mark column on the
+senders you want gone:
 
 ```
-# approved.txt
-news@deals.example.com
-no-reply@sketchy.example.net
+# mark flag sender                                    n  score  signals
+t           news@deals.example.com                   60      8  List-Unsubscribe, ...
+t           no-reply@sketchy.example.net             12      9  no-reply, SPF/DKIM fail
+.     [!]   alerts@mybank.example.com                30      8  protected-domain, ...
+.           jane@friend.example.com                   4      0
 ```
+
+`[!]` is a safeguarded sender. Nothing pre-marks one, and trashing one costs a
+second deliberate confirmation at execute time.
+
+Re-running `rank --review` keeps the marks already in the file, so you can
+review across several sittings, or fetch more mail part way through, without
+losing a decision.
+
+`--preselect-score N` pre-marks unguarded senders scoring at or above `N`. It
+is off by default: the friction being removed is transcription, not judgement.
+
+<details>
+<summary>The older <code>--senders approved.txt</code> path still works</summary>
+
+One address per line, `#` comments allowed. `trash --review` takes precedence
+if both are given.
+</details>
 
 ### 6. Dry run, then execute
 
 ```bash
-python gmail_audit.py trash --senders approved.txt              # dry run
-python gmail_audit.py trash --senders approved.txt --execute
+python gmail_audit.py trash --review review.txt              # dry run
+python gmail_audit.py trash --review review.txt --execute
 ```
 
 Prompts between batches. Writes `trashed-manifest.jsonl` before touching
@@ -208,6 +233,24 @@ python gmail_audit.py untrash --manifest trashed-manifest.jsonl --execute
 ```
 
 Or empty Gmail's Trash yourself after 30 days if you're satisfied.
+
+### Checking on a scan you walked away from
+
+A full fetch takes tens of minutes. It publishes its progress to
+`fetch-status.json` as it goes, so any other terminal can ask:
+
+```bash
+python gmail_audit.py status
+```
+
+```
+fetch    running      18,450/35,012    52.7%   27.6 msg/s  eta 11m28s  drops 2
+         limit 26.0/s ramping · query in:inbox · updated 1s ago · pid 4242
+```
+
+A scan that was killed reads as `STALE` rather than as permanently running,
+because liveness comes from the file's timestamp. The UI reads the same file,
+so the browser reports a scan started in a terminal.
 
 ---
 
@@ -236,7 +279,11 @@ It is deliberately small in what it can do:
   machinery above landed first, on a surface that cannot delete anything, so
   it is not the deletion path's first draft that gets tested.
 
-Ranking, selection and execute-with-undo are designed but not built — see
+It also reports a scan started from a terminal, by reading the same status
+file `gmail_audit.py status` reads, and refuses to start a second one over it.
+
+A review table in the browser is designed but not built, and executing from the
+browser probably should not be — see
 [docs/DESIGN-UI.md](docs/DESIGN-UI.md).
 
 ---
@@ -323,7 +370,7 @@ Restart the shell, or the tool will look missing when it isn't.
 
 - Read message bodies
 - Permanently delete anything
-- Act without an explicit approved-sender list
+- Act without an explicit list of senders you marked yourself
 - Score based on `Subject`
 - Listen on anything but loopback, or serve a request without the per-launch
   token
@@ -337,13 +384,15 @@ API using your credentials.
 
 ## Roadmap
 
-Shipped: the global rate limiter (see Rate limits above) and the first half of
-the browser UI — preflight and live scan progress.
+Shipped: the global rate limiter, preflight and live scan progress in the
+browser, a status file that makes a scan walk-away-able, and the review file
+that removes `approved.txt` transcription.
 
-Next: click-to-select review instead of hand-editing `approved.txt`, then
-execute-and-undo in the browser, then incremental rescans via the History API
-so a repeat audit takes seconds rather than an hour. See
-[docs/DESIGN-UI.md](docs/DESIGN-UI.md), and
+Next: incremental rescans via the History API, so a repeat audit takes seconds
+rather than an hour. A review table in the browser is optional and would be a
+view over the review file rather than a second selection mechanism; executing
+from the browser is under review and probably not worth the mutating endpoint.
+See [docs/DESIGN-UI.md](docs/DESIGN-UI.md), and
 [docs/PLAN-RATE-LIMITER.md](docs/PLAN-RATE-LIMITER.md) for how the limiter
 works.
 
