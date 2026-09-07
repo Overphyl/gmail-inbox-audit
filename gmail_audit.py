@@ -655,13 +655,18 @@ def _progress_line(progress, limiter):
     return line
 
 
-def _progress_reporter(progress, limiter, stop, interval=2.0, plain_every=10.0):
-    """Print the live line from its own thread.
+def _progress_reporter(progress, limiter, stop, interval=2.0, plain_every=10.0,
+                       status=None):
+    """Print the live line from its own thread, and publish it to disk.
 
     It has to be a thread rather than a print inside the ex.map consumer:
     printing from the consumer freezes during a global pause, which is the
     exact pathology this phase fixes. A stall should read as "backoff 12s",
     not as a frozen counter.
+
+    The status file rides on this same tick rather than getting a thread of
+    its own: it is the identical snapshot, and a second timer would be a
+    second thing to stop on Ctrl-C.
     """
     try:
         tty = sys.stderr.isatty()
@@ -672,6 +677,8 @@ def _progress_reporter(progress, limiter, stop, interval=2.0, plain_every=10.0):
     while True:
         stopping = stop.wait(interval)
         line = _progress_line(progress, limiter)
+        if status is not None:
+            status.write(progress, limiter)
         if tty:
             sys.stderr.write("\r" + line.ljust(width))
             sys.stderr.flush()
@@ -687,6 +694,160 @@ def _progress_reporter(progress, limiter, stop, interval=2.0, plain_every=10.0):
                 sys.stderr.write("\n")
                 sys.stderr.flush()
             return
+
+
+# The scan is an hour long and dies with the shell that started it. Without a
+# file on disk, "how far along is the run in that other window?" has no
+# answer, and cmd_ui can only report on scans it started itself.
+FETCH_STATUS = "fetch-status.json"
+ENGAGED_STATUS = "engaged-status.json"
+STATUS_STALE_AFTER = 15.0  # ~7 missed reporter ticks
+
+
+class StatusWriter:
+    """Publish the live counters to a file for a reader in another process.
+
+    Liveness is judged by the file's mtime and NEVER by probing the pid.
+    os.kill(pid, 0) is the usual idiom and it is a trap here: on POSIX it
+    tests for existence, but on Windows os.kill ignores the signal for
+    anything but CTRL_C_EVENT/CTRL_BREAK_EVENT and calls TerminateProcess -
+    so the same line that asks "is the scan alive?" would kill it. The pid is
+    recorded for a human to act on, not for this module to signal.
+    """
+
+    def __init__(self, path, command, query="", cache=""):
+        self.path = path or None
+        self.command = command
+        self.query = query
+        self.cache = cache
+        self.pid = os.getpid()
+        # Wall clock, not monotonic: a monotonic value means nothing to
+        # another process, and this file exists to be read by one.
+        self.started = time.time()
+        self._lock = threading.Lock()
+
+    def write(self, progress, limiter, state="running"):
+        if not self.path:
+            return
+        p = progress.snapshot()
+        st = limiter.stats() if limiter is not None else None
+        payload = {
+            "command": self.command,
+            "pid": self.pid,
+            "state": state,
+            # The query can name a sender, so this file is mailbox data and
+            # is gitignored like the rest. It carries no addresses of its own.
+            "query": self.query,
+            "cache": self.cache,
+            "started": self.started,
+            "updated": time.time(),
+            "total": p["total"],
+            "done": p["done"],
+            "dropped": p["dropped"],
+            "elapsed": p["elapsed"],
+            "rate": p["rate"],
+            "avg_rate": p["avg_rate"],
+            "eta": p["eta"],
+            "aborted": p["aborted"],
+            "limiter": None if st is None else {
+                "rate": st["rate"], "state": st["state"],
+                "throttles": st["throttles"],
+            },
+        }
+        tmp = self.path + ".tmp"
+        try:
+            with self._lock:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(payload, f)
+                # Atomic on POSIX and on Windows: a reader polling this file
+                # must never catch a half-written document.
+                os.replace(tmp, self.path)
+        except OSError:
+            # Telemetry. A scan must never die because its status file could
+            # not be written.
+            pass
+
+
+def read_status(path):
+    """Return the status dict with staleness derived, or None."""
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict):
+        return None
+    try:
+        d["age"] = max(0.0, time.time() - os.path.getmtime(path))
+    except OSError:
+        d["age"] = 0.0
+    # A killed scan leaves state "running" behind forever. The mtime is what
+    # distinguishes "still going" from "the process is gone".
+    d["stale"] = bool(d.get("state") == "running"
+                      and d["age"] > STATUS_STALE_AFTER)
+    d["path"] = path
+    return d
+
+
+def _fmt_ago(seconds):
+    return "just now" if seconds < 1.5 else _fmt_eta(seconds) + " ago"
+
+
+def _status_lines(d):
+    """Render one status file as two lines."""
+    state = "STALE" if d["stale"] else str(d.get("state", "?"))
+    total, done = d.get("total") or 0, d.get("done") or 0
+    pct = (100.0 * done / total) if total else 100.0
+    # A stale file's last rate describes a process that no longer exists.
+    # Printing it reads as live throughput, so it is suppressed.
+    rate = 0.0 if d["stale"] else (d.get("rate") or 0.0)
+    eta = 0.0 if d["stale"] else (d.get("eta") or 0)
+    head = "{:<9}{:<9}{:>9}/{:<9}{:5.1f}%  {:5.1f} msg/s  eta {:<7} drops {}".format(
+        d.get("command", "?"), state, "{:,}".format(done), "{:,}".format(total),
+        pct, rate, _fmt_eta(eta), d.get("dropped") or 0,
+    )
+    lim = d.get("limiter")
+    bits = []
+    if lim:
+        bits.append("limit {:.1f}/s {}".format(lim["rate"], lim["state"]))
+    if d.get("query"):
+        bits.append("query {}".format(d["query"]))
+    bits.append("updated " + _fmt_ago(d["age"]))
+    bits.append("pid {}".format(d.get("pid", "?")))
+    tail = "         " + " · ".join(bits)
+    lines = [head, tail]
+    if d["stale"]:
+        lines.append(
+            "         the process is gone. Re-run {} to resume; the cache "
+            "diffs IDs, so\n         nothing already fetched is "
+            "re-requested.".format(d.get("command", "fetch"))
+        )
+    elif d.get("aborted"):
+        lines.append("         aborted: {}".format(d["aborted"]))
+    return lines
+
+
+def cmd_status(a):
+    """Report on a scan running in another terminal, or the last one to run."""
+    paths = a.files or [FETCH_STATUS, ENGAGED_STATUS]
+    found = [d for d in (read_status(p) for p in paths) if d]
+    if a.json:
+        print(json.dumps(found, indent=2))
+        return
+    if not found:
+        print(
+            "no scan status found.\n"
+            "  Looked in: {}\n"
+            "  A status file appears once 'fetch' or 'engaged' starts, and\n"
+            "  survives the run, so this also reports the last completed "
+            "scan.".format(", ".join(paths))
+        )
+        return
+    for d in found:
+        for line in _status_lines(d):
+            print(line)
 
 
 def _pacing_note(a):
@@ -728,15 +889,25 @@ def _scan(ids, a, progress, headers=None):
             raise
 
 
-def _with_reporter(progress):
+def _with_reporter(progress, status=None):
     """Start the reporter thread; returns (stop_event, thread)."""
     stop = threading.Event()
     t = threading.Thread(
-        target=_progress_reporter, args=(progress, LIMITER, stop)
+        target=_progress_reporter, args=(progress, LIMITER, stop),
+        kwargs={"status": status},
     )
     t.daemon = True
     t.start()
     return stop, t
+
+
+def _final_state(progress, interrupted):
+    """The terminal state a status reader should see once a scan stops."""
+    if interrupted:
+        return "interrupted"
+    if progress.aborted:
+        return "aborted"
+    return "done"
 
 
 def _report_drops(progress, total, label):
@@ -797,9 +968,11 @@ def cmd_fetch(a):
     progress = FetchProgress(len(todo), drop_path=getattr(a, "dropped", "") or None)
     PROGRESS = progress
     a.progress = progress
+    status = StatusWriter(getattr(a, "status", "") or None, "fetch",
+                          query=a.query, cache=a.cache)
 
     interrupted = False
-    stop, reporter = _with_reporter(progress)
+    stop, reporter = _with_reporter(progress, status)
     try:
         with open(a.cache, "a", encoding="utf-8") as out:
             for start in range(0, len(todo), a.batch):
@@ -826,6 +999,9 @@ def cmd_fetch(a):
         stop.set()
         reporter.join(timeout=5.0)
         progress.close()
+        # The terminal state, so a reader after the fact sees an outcome
+        # rather than a run that looks stalled forever.
+        status.write(progress, LIMITER, _final_state(progress, interrupted))
 
     # Reconciliation, printed even on a clean run: it is the only check that
     # catches a SILENT undercount as well as an error-counted one.
@@ -858,7 +1034,10 @@ def cmd_engaged(a):
     # failure, not partial.
     progress = FetchProgress(len(ids), drop_path=getattr(a, "dropped", "") or None)
     a.progress = progress
-    stop, reporter = _with_reporter(progress)
+    status = StatusWriter(getattr(a, "status", "") or None, "engaged",
+                          query="in:sent", cache=a.out)
+    stop, reporter = _with_reporter(progress, status)
+    interrupted = False
     try:
         for rec in _scan(ids, a, progress, ENGAGED_HEADERS):
             if not rec:
@@ -867,10 +1046,14 @@ def cmd_engaged(a):
             for field in ("to", "cc", "bcc"):
                 for m in ADDR.finditer(rec["headers"].get(field, "")):
                     addrs.add(m.group(0).lower())
+    except KeyboardInterrupt:
+        interrupted = True
+        raise
     finally:
         stop.set()
         reporter.join(timeout=5.0)
         progress.close()
+        status.write(progress, LIMITER, _final_state(progress, interrupted))
     _report_drops(progress, len(ids), "engaged")
     _report_abort(progress)
 
@@ -960,15 +1143,81 @@ def score_sender(sender, group):
     return score, signals
 
 
+def load_engaged(path):
+    """The replied-to safeguard list, or an empty set."""
+    if not path or not os.path.exists(path):
+        return set()
+    with open(path, encoding="utf-8") as f:
+        return {l.strip().lower() for l in f if l.strip()}
+
+
+def sender_guard(sender, group, engaged):
+    """The false-positive safeguard for one sender, or None.
+
+    Shared by cmd_rank and cmd_trash on purpose. cmd_trash recomputes it from
+    the cache rather than trusting the [!] flag in a review file, so deleting
+    that flag by hand removes the marker but not the warning.
+    """
+    if sender in engaged:
+        return "replied-to"
+    if any(p in sender for p in PROTECTED):
+        return "protected-domain"
+    if any("STARRED" in m["labelIds"] or "IMPORTANT" in m["labelIds"]
+           for m in group):
+        return "starred/important"
+    return None
+
+
+def group_by_sender(msgs):
+    by_sender = collections.defaultdict(list)
+    for m in msgs:
+        s = addr_of(m["headers"].get("from", ""))
+        if s:
+            by_sender[s].append(m)
+    for group in by_sender.values():
+        group.sort(key=lambda m: int(m.get("internalDate") or 0))
+    return by_sender
+
+
+def rank_rows(msgs, engaged=()):
+    """Score every sender and return the ranked rows.
+
+    Returning rows rather than printing them is what lets the table, the JSON
+    and the review file be three renderings of ONE ranking rather than three
+    rankings that have to be kept in agreement.
+    """
+    engaged = set(engaged)
+    rows = []
+    for sender, group in group_by_sender(msgs).items():
+        score, signals = score_sender(sender, group)
+        # False-positive safeguards: these demote to Review, never Trash.
+        guard = sender_guard(sender, group, engaged)
+        if guard:
+            rec = "Review"
+        elif score >= 6:
+            rec = "Trash"
+        elif score >= 3:
+            rec = "Review"
+        else:
+            rec = "Keep"
+        rows.append({
+            "sender": sender,
+            "count": len(group),
+            "score": score,
+            "signals": signals,
+            "rec": rec,
+            "guard": guard,
+        })
+    rows.sort(key=lambda r: (-r["score"], -r["count"]))
+    return rows
+
+
 def cmd_rank(a):
     msgs = load_cache(a.cache)
     if not msgs:
         sys.exit("no cached headers at {} - run 'fetch' first".format(a.cache))
 
-    engaged = set()
-    if a.engaged and os.path.exists(a.engaged):
-        with open(a.engaged, encoding="utf-8") as f:
-            engaged = {l.strip().lower() for l in f if l.strip()}
+    engaged = load_engaged(a.engaged)
     if not engaged:
         print(
             "WARNING: no engaged-sender list ({}). The 'you have corresponded\n"
@@ -979,50 +1228,13 @@ def cmd_rank(a):
             file=sys.stderr,
         )
 
-    by_sender = collections.defaultdict(list)
-    for m in msgs:
-        s = addr_of(m["headers"].get("from", ""))
-        if s:
-            by_sender[s].append(m)
+    rows = rank_rows(msgs, engaged)
 
-    rows = []
-    for sender, group in by_sender.items():
-        group.sort(key=lambda m: int(m.get("internalDate") or 0))
-        score, signals = score_sender(sender, group)
-
-        # False-positive safeguards: these demote to Review, never Trash.
-        guard = None
-        if sender in engaged:
-            guard = "replied-to"
-        elif any(p in sender for p in PROTECTED):
-            guard = "protected-domain"
-        elif any(
-            "STARRED" in m["labelIds"] or "IMPORTANT" in m["labelIds"]
-            for m in group
-        ):
-            guard = "starred/important"
-
-        if guard:
-            rec = "Review"
-        elif score >= 6:
-            rec = "Trash"
-        elif score >= 3:
-            rec = "Review"
-        else:
-            rec = "Keep"
-
-        rows.append(
-            {
-                "sender": sender,
-                "count": len(group),
-                "score": score,
-                "signals": signals,
-                "rec": rec,
-                "guard": guard,
-            }
-        )
-
-    rows.sort(key=lambda r: (-r["score"], -r["count"]))
+    if getattr(a, "review", None):
+        summary = write_review(a.review, rows,
+                               preselect_score=getattr(a, "preselect_score", 0))
+        _report_review(a.review, summary)
+        return
 
     if a.json:
         print(json.dumps(rows, indent=2))
@@ -1050,6 +1262,190 @@ def cmd_rank(a):
         len(keep), sum(r["count"] for r in keep)))
 
 
+# ------------------------------------------------------------------ review
+# The ranked index and the approval list used to be two different artifacts,
+# so a human retyped addresses from one into the other. That is transcription
+# work, and a typo in it produces a no-op rather than an error. The review
+# file is both: it is what `rank` emits and what `trash` reads, so a decision
+# costs one character and never an address.
+#
+# It does NOT relax "approval is a list, not a threshold". Every row is
+# written unmarked. --preselect-score marks rows for you, but it is a flag you
+# have to type, and it will not mark a safeguarded sender under any
+# circumstances. The file you save is still the decision.
+REVIEW_FILE = "review.txt"
+REVIEW_MARKS = {"t": True, ".": False}
+REVIEW_GUARD_FLAG = "[!]"
+
+REVIEW_HEADER = """\
+# gmail-audit review
+# {senders} senders, {messages} messages, generated {when}
+#
+# The mark column is the decision. 't' trashes every message from that
+# sender; '.' leaves it alone. Nothing else is accepted - an unknown mark is
+# an error, not a silently skipped line.
+#
+#     python gmail_audit.py trash --review {path}            # dry run
+#     python gmail_audit.py trash --review {path} --execute
+#
+# {flag} is a safeguarded sender: you have written to them, they are on a
+# protected domain, or you starred them. --preselect-score never marks these,
+# and trashing one takes a keystroke you typed on that row yourself.
+#
+# Re-running rank keeps the marks already in this file, so reviewing in
+# several sittings is safe, and so is fetching more mail part way through.
+#
+# mark flag {sender:<44}{n:>6}{score:>7}  signals
+"""
+
+
+def _review_line(row, mark):
+    return "{}     {:<6}{:<44}{:>6}{:>7}  {}".format(
+        mark,
+        REVIEW_GUARD_FLAG if row["guard"] else "",
+        row["sender"][:43],
+        row["count"],
+        row["score"],
+        ", ".join(([row["guard"]] if row["guard"] else []) + row["signals"]),
+    ).rstrip()  # a Keep row has no signals; no trailing whitespace
+
+
+def parse_review(path, strict=True):
+    """Read a review file. Returns (marks, errors).
+
+    marks maps sender -> True (trash) or False (leave alone). Parsing splits
+    on whitespace, so re-aligning or re-ordering the file by hand is fine and
+    only the mark and the address carry meaning.
+    """
+    marks, errors, seen = {}, [], {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = list(enumerate(f, 1))
+    except OSError as e:
+        return {}, ["cannot read {}: {}".format(path, e)]
+    for n, raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        mark = parts[0]
+        rest = parts[1:]
+        if rest and rest[0] == REVIEW_GUARD_FLAG:
+            rest = rest[1:]
+        if mark not in REVIEW_MARKS:
+            errors.append(
+                "line {}: mark {!r} is not one of {}".format(
+                    n, mark, " ".join(sorted(REVIEW_MARKS))))
+            continue
+        if not rest:
+            errors.append("line {}: no sender address".format(n))
+            continue
+        sender = rest[0].lower()
+        # A mangled address must not become a silent no-op - that is exactly
+        # the failure mode this file exists to remove.
+        if addr_of(sender) != sender:
+            errors.append("line {}: {!r} is not an address".format(n, rest[0]))
+            continue
+        if sender in seen:
+            errors.append(
+                "line {}: {} already appears on line {}".format(
+                    n, sender, seen[sender]))
+            continue
+        seen[sender] = n
+        marks[sender] = REVIEW_MARKS[mark]
+    return marks, (errors if strict else [])
+
+
+def write_review(path, rows, preselect_score=0):
+    """Write the review file, carrying forward any marks already in it.
+
+    Merging is the default and there is no overwrite flag: silently discarding
+    a half-finished review is a worse failure than any it would prevent. A
+    fresh file is one `rm` away.
+    """
+    prior, _ = parse_review(path, strict=False) if os.path.exists(path) else ({}, [])
+    carried = kept_marked = preselected = 0
+    body = []
+    for row in rows:
+        sender = row["sender"]
+        if sender in prior:
+            carried += 1
+            marked = prior[sender]
+            if marked:
+                kept_marked += 1
+        elif preselect_score and not row["guard"] and row["score"] >= preselect_score:
+            marked = True
+            preselected += 1
+        else:
+            marked = False
+        body.append(_review_line(row, "t" if marked else "."))
+
+    header = REVIEW_HEADER.format(
+        senders=len(rows),
+        messages=sum(r["count"] for r in rows),
+        when=datetime.datetime.now().isoformat(timespec="minutes"),
+        path=path,
+        flag=REVIEW_GUARD_FLAG,
+        sender="sender", n="n", score="score",
+    )
+    # Via a temp file: this reads and rewrites the same path, so a crash part
+    # way through would otherwise take the decisions with it.
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(header)
+        f.write("\n".join(body) + "\n")
+    os.replace(tmp, path)
+    return {
+        "senders": len(rows),
+        "carried": carried,
+        "kept_marked": kept_marked,
+        "preselected": preselected,
+        "dropped": len(set(prior) - {r["sender"] for r in rows}),
+        "marked": kept_marked + preselected,
+    }
+
+
+def _report_review(path, summary):
+    print("wrote {} ({} senders)".format(path, summary["senders"]))
+    if summary["carried"]:
+        print("  carried forward {} marks from the existing file ({} still "
+              "marked for trash)".format(summary["carried"],
+                                         summary["kept_marked"]))
+    if summary["dropped"]:
+        print("  {} senders in the old file are no longer in the cache and "
+              "were dropped".format(summary["dropped"]))
+    if summary["preselected"]:
+        print("  pre-marked {} senders for trash; safeguarded senders were "
+              "NOT marked".format(summary["preselected"]))
+    print()
+    print("Edit the mark column, then:")
+    print("    python gmail_audit.py trash --review {}".format(path))
+    if not summary["marked"]:
+        print("\nNothing is marked yet. That is deliberate: an unmarked file "
+              "trashes nothing.")
+
+
+def load_review_approved(path):
+    """The approved set from a review file. Exits on any parse error."""
+    if not os.path.exists(path):
+        sys.exit(
+            "review file not found: {}\n"
+            "Create it with:  python gmail_audit.py rank --review {}".format(
+                path, path))
+    marks, errors = parse_review(path, strict=True)
+    if errors:
+        sys.exit(
+            "{} is not readable as a review file:\n  {}\n"
+            "Refusing to guess what was meant - fix the lines above and "
+            "re-run.".format(path, "\n  ".join(errors[:10])))
+    approved = {s for s, marked in marks.items() if marked}
+    if not approved:
+        sys.exit(
+            "nothing is marked 't' in {} - nothing to do.\n"
+            "Change the mark column on the senders you want gone.".format(path))
+    return approved
+
+
 # ------------------------------------------------------------------- trash
 # NOTE: This module calls messages.trash ONLY. messages.delete and
 # messages.batchDelete are deliberately absent - they require the
@@ -1074,20 +1470,29 @@ def cmd_trash(a):
     Takes a sender file, never a score threshold - the approval decision is
     made by a human reading the ranked index, not by this script.
     """
-    if not os.path.exists(a.senders):
-        sys.exit(
-            "approved sender list not found: {}\n"
-            "Create it from the ranked index - one address per line. "
-            "This command will not act on a score threshold.".format(a.senders)
-        )
-    with open(a.senders, encoding="utf-8") as f:
-        approved = {
-            l.strip().lower()
-            for l in f
-            if l.strip() and not l.startswith("#")
-        }
-    if not approved:
-        sys.exit("approved sender list is empty - nothing to do")
+    source = getattr(a, "review", None)
+    if source:
+        approved = load_review_approved(source)
+    else:
+        source = a.senders
+        if not os.path.exists(source):
+            sys.exit(
+                "approved sender list not found: {}\n"
+                "Create it from the ranked index - one address per line - or "
+                "use the\nreview file, which needs no transcription:\n"
+                "    python gmail_audit.py rank --review {}\n"
+                "    python gmail_audit.py trash --review {}\n"
+                "Either way this command will not act on a score "
+                "threshold.".format(source, REVIEW_FILE, REVIEW_FILE)
+            )
+        with open(source, encoding="utf-8") as f:
+            approved = {
+                l.strip().lower()
+                for l in f
+                if l.strip() and not l.startswith("#")
+            }
+        if not approved:
+            sys.exit("approved sender list is empty - nothing to do")
 
     msgs = load_cache(a.cache)
     if not msgs:
@@ -1107,15 +1512,51 @@ def cmd_trash(a):
                 }
             )
 
+    # Recomputed from the cache, never read off the review file: deleting the
+    # [!] flag by hand removes the marker, not the warning. Safeguards still
+    # do not override the human's list - they are surfaced, then obeyed.
+    engaged = load_engaged(getattr(a, "engaged", ""))
+    groups = group_by_sender(msgs)
+    overrides = {
+        s: sender_guard(s, groups[s], engaged)
+        for s in approved if s in groups and sender_guard(s, groups[s], engaged)
+    }
+
     by_sender = collections.Counter(t["sender"] for t in targets)
-    print("Approved senders : {}".format(len(approved)))
+    print("Approved senders : {} (from {})".format(len(approved), source))
     print("Matching messages: {}".format(len(targets)))
     print()
     for s, n in by_sender.most_common():
-        print("  {:<48}{:>6}".format(s[:47], n))
+        flag = " {}".format(REVIEW_GUARD_FLAG) if s in overrides else ""
+        print("  {:<48}{:>6}{}".format(s[:47], n, flag))
     missing = approved - set(by_sender)
+    if missing and getattr(a, "review", None):
+        # The review file was GENERATED from this cache, so a marked sender
+        # with nothing to match did not come from the ranking - it was typed.
+        # A transposed domain is still a syntactically valid address, so the
+        # parser cannot catch it; this is where it stops being silent. The
+        # plain --senders path keeps the softer note below, because there the
+        # list is hand-written by design.
+        sys.exit(
+            "\n{} marked sender(s) have no messages in {}:\n  {}\n"
+            "This file is generated from that cache, so a marked sender that "
+            "matches nothing\nwas typed by hand and is probably a typo - a "
+            "transposed domain is still a valid\naddress. Fix the line, or "
+            "re-run: python gmail_audit.py rank --review {}".format(
+                len(missing), a.cache, "\n  ".join(sorted(missing)), source))
     if missing:
         print("\n  (no cached messages for: {})".format(", ".join(sorted(missing))))
+
+    if overrides:
+        print()
+        print("SAFEGUARD OVERRIDE - {} approved sender(s) are protected:".format(
+            len(overrides)))
+        for s in sorted(overrides):
+            print("  {:<48}{:>6}  {}".format(
+                s[:47], by_sender.get(s, 0), overrides[s]))
+        print("  You have written to these, they are on a protected domain, or")
+        print("  you starred them. Nothing pre-marks a safeguarded sender; each")
+        print("  of these was approved by hand.")
 
     if not targets:
         sys.exit("\nnothing matched - stopping")
@@ -1131,6 +1572,18 @@ def cmd_trash(a):
         print("\nDRY RUN - nothing was modified.")
         print("Re-run with --execute to move these to Trash (recoverable 30 days).")
         return
+
+    # DESIGN-UI.md: a safeguarded sender must never be swept along, it has to
+    # be an individual, deliberate act. Marking the row was the first half;
+    # this is the second, and it is one prompt for the whole set rather than
+    # one per sender because the marking was already per sender.
+    if overrides and not a.yes:
+        resp = input(
+            "\n{} safeguarded sender(s) are in this run. Type 'override' to "
+            "include\nthem, anything else to stop: ".format(len(overrides))
+        )
+        if resp.strip().lower() != "override":
+            sys.exit("stopped - nothing was modified.")
 
     done = 0
     for start in range(0, len(targets), a.batch):
@@ -1364,6 +1817,10 @@ def _ui_scan_args(base, query, concurrency, limit):
         concurrency=concurrency,
         limit=limit,
         dropped=getattr(base, "dropped", FETCH_DROPPED),
+        # "" not FETCH_STATUS: the ui parser always supplies a real default,
+        # so a namespace without one means disabled rather than "guess a path
+        # and write into whatever directory we happen to be in".
+        status=getattr(base, "status", ""),
     )
 
 
@@ -1508,6 +1965,8 @@ class _UIHandler(BaseHTTPRequestHandler):
     def _progress(self):
         scan = self.server.ui_scan.snapshot()
         progress = PROGRESS.snapshot() if PROGRESS is not None else None
+        scan["source"] = "in-process"
+        external_limiter = None
         # list_ids() runs before any counter exists, and on a large mailbox
         # that is minutes. Naming the phase is the difference between "still
         # enumerating" and "wedged".
@@ -1515,11 +1974,31 @@ class _UIHandler(BaseHTTPRequestHandler):
             scan["phase"] = "listing" if progress is None else "fetching"
         else:
             scan["phase"] = scan["status"]
-        return {
-            "scan": scan,
-            "progress": progress,
-            "limiter": LIMITER.stats() if LIMITER is not None else None,
-        }
+            # A scan started from a terminal is the common case - the CLI is
+            # the reference path. Reading its status file is what stops this
+            # page from reporting "idle" over a running hour-long fetch.
+            ext = read_status(getattr(self.server.ui_args, "status", ""))
+            if ext:
+                scan["source"] = "file"
+                scan["query"] = ext.get("query")
+                scan["phase"] = "stale" if ext["stale"] else ext.get("state")
+                # This process's limiter is idle and says nothing about the
+                # run being reported. Showing it would read as that run's pace.
+                external_limiter = None if ext["stale"] else ext.get("limiter")
+                progress = {
+                    "total": ext.get("total") or 0,
+                    "done": ext.get("done") or 0,
+                    "dropped": ext.get("dropped") or 0,
+                    "elapsed": ext.get("elapsed") or 0.0,
+                    "rate": 0.0 if ext["stale"] else (ext.get("rate") or 0.0),
+                    "avg_rate": ext.get("avg_rate") or 0.0,
+                    "eta": 0.0 if ext["stale"] else (ext.get("eta") or 0.0),
+                    "aborted": ext.get("aborted"),
+                }
+        limiter = LIMITER.stats() if LIMITER is not None else None
+        if scan["source"] == "file":
+            limiter = external_limiter
+        return {"scan": scan, "progress": progress, "limiter": limiter}
 
     def _read_json(self):
         try:
@@ -1556,6 +2035,15 @@ class _UIHandler(BaseHTTPRequestHandler):
             return
         if limit < 0:
             self._json(400, {"error": "limit must be >= 0"})
+            return
+        # A scan running in a terminal shares this mailbox's quota and this
+        # cache. The button is disabled for it, but the guard belongs here:
+        # the page is not the only thing that can post to this endpoint.
+        ext = read_status(getattr(self.server.ui_args, "status", ""))
+        if ext and ext.get("state") == "running" and not ext["stale"]:
+            self._json(409, {"error": "a scan started elsewhere is still "
+                                      "running (pid {})".format(
+                                          ext.get("pid", "?"))})
             return
         state = self.server.ui_scan
         if not state.begin(query):
@@ -1768,6 +2256,7 @@ UI_HTML = r"""<!doctype html>
       <button id="scan-btn" type="button">Start scan</button>
       <span id="scan-status" class="status">idle</span>
     </div>
+    <p class="note" id="scan-source" hidden></p>
     <div class="bar"><div id="bar"></div></div>
     <div class="barline">
       <span class="k">limiter</span><span class="mono" id="p-limit">&mdash;</span>
@@ -1875,8 +2364,11 @@ UI_HTML = r"""<!doctype html>
     idle: "idle",
     listing: "enumerating message IDs…",
     fetching: "fetching headers",
+    running: "running",
     done: "complete",
     aborted: "aborted",
+    interrupted: "interrupted",
+    stale: "stopped without finishing",
     failed: "failed"
   };
   var timer = null;
@@ -1913,11 +2405,25 @@ UI_HTML = r"""<!doctype html>
     var lim = d.limiter;
     var running = scan.status === "running";
 
+    var external = scan.source === "file";
     put("scan-status", PHASE_LABEL[scan.phase] || scan.phase || "idle");
-    cls("scan-status", running ? "warn"
-        : (scan.status === "done" ? "ok"
-        : (scan.status === "idle" ? "" : "bad")));
-    $("scan-btn").disabled = running;
+    cls("scan-status", (running || scan.phase === "running") ? "warn"
+        : (scan.phase === "done" ? "ok"
+        : (scan.phase === "idle" ? "" : "bad")));
+    // Disabled for a scan started elsewhere too: it shares this mailbox's
+    // quota and this cache, and the server refuses it either way.
+    $("scan-btn").disabled = running || scan.phase === "running";
+
+    // The CLI is the reference path, so a scan is at least as likely to have
+    // been started from a terminal as from this page.
+    show("scan-source", external);
+    if (external) {
+      put("scan-source", scan.phase === "stale"
+        ? "A scan started elsewhere stopped without finishing. Re-run it; the "
+          + "cache resumes."
+        : "Reading a scan started in another terminal"
+          + (scan.query ? " (" + scan.query + ")" : "") + ".");
+    }
 
     if (scan.error) {
       show("scan-error", true);
@@ -1927,8 +2433,7 @@ UI_HTML = r"""<!doctype html>
     if (p) {
       var pct = p.total ? (100 * p.done / p.total) : 0;
       $("bar").style.width = Math.min(100, pct).toFixed(1) + "%";
-      put("p-done", num(p.done) + " / " + num(p.total)
-                    + "  (" + pct.toFixed(1) + "%)");
+      put("p-done", num(p.done) + " / " + num(p.total));
       put("p-rate", p.rate.toFixed(1) + " msg/s");
       put("p-avg", p.avg_rate.toFixed(1) + " msg/s");
       put("p-eta", eta(p.eta));
@@ -1946,8 +2451,10 @@ UI_HTML = r"""<!doctype html>
   function poll() {
     if (timer) { clearTimeout(timer); timer = null; }
     api("/api/progress").then(function (r) {
-      var running = render(r.body || {});
-      timer = setTimeout(poll, running ? 1000 : 4000);
+      var d = r.body || {};
+      var running = render(d);
+      var live = running || (d.scan && d.scan.phase === "running");
+      timer = setTimeout(poll, live ? 1000 : 4000);
     }).catch(function () {
       timer = setTimeout(poll, 4000);
     });
@@ -1964,8 +2471,8 @@ UI_HTML = r"""<!doctype html>
 """
 
 
-def _add_rate_args(sub, dropped_default=None):
-    """The pacing knobs. Shared by every subcommand that hits the API in bulk."""
+def _add_rate_args(sub, dropped_default=None, status_default=None):
+    """The pacing knobs, plus the two per-run side files that ride with them."""
     sub.add_argument("--rate", type=float, default=0.0,
                      help="pin a fixed req/s; 0 (default) adapts. Throttles "
                           "still pause but never shrink a pinned rate")
@@ -1979,6 +2486,11 @@ def _add_rate_args(sub, dropped_default=None):
         sub.add_argument("--dropped", default=dropped_default,
                          help="JSONL of message IDs this run could not fetch "
                               "(default %(default)s); empty string disables")
+    if status_default is not None:
+        sub.add_argument("--status", default=status_default,
+                         help="live progress published here for 'status' and "
+                              "the UI to read (default %(default)s); empty "
+                              "string disables")
 
 
 def _make_limiter(a):
@@ -2022,25 +2534,46 @@ def main():
     # effect the limiter does not repeal.
     f.add_argument("--concurrency", type=int, default=12)
     f.add_argument("--limit", type=int, default=0)
-    _add_rate_args(f, FETCH_DROPPED)
+    _add_rate_args(f, FETCH_DROPPED, FETCH_STATUS)
     f.set_defaults(func=cmd_fetch)
 
     e = sub.add_parser("engaged", help="build replied-to address list")
     e.add_argument("--out", default="engaged.txt")
     e.add_argument("--concurrency", type=int, default=8)
     e.add_argument("--limit", type=int, default=0)
-    _add_rate_args(e, ENGAGED_DROPPED)
+    _add_rate_args(e, ENGAGED_DROPPED, ENGAGED_STATUS)
     e.set_defaults(func=cmd_engaged)
 
     r = sub.add_parser("rank", help="score senders")
     r.add_argument("--cache", default="headers.jsonl")
     r.add_argument("--engaged", default="engaged.txt")
     r.add_argument("--json", action="store_true")
+    r.add_argument("--review", nargs="?", const=REVIEW_FILE, default=None,
+                   help="write a reviewable file (default %(const)s) instead "
+                        "of the table; marks already in it are carried "
+                        "forward")
+    r.add_argument("--preselect-score", type=int, default=0, metavar="N",
+                   help="pre-mark unguarded senders scoring >= N. Safeguarded "
+                        "senders are never marked. Off by default, because "
+                        "the friction being removed is partly protective")
     r.set_defaults(func=cmd_rank)
+
+    st = sub.add_parser("status", help="report on a scan running elsewhere")
+    st.add_argument("files", nargs="*",
+                    help="status files to read (default: {} and {})".format(
+                        FETCH_STATUS, ENGAGED_STATUS))
+    st.add_argument("--json", action="store_true")
+    st.set_defaults(func=cmd_status)
 
     t = sub.add_parser("trash", help="trash messages from approved senders")
     t.add_argument("--senders", default="approved.txt",
-                   help="approved sender addresses, one per line (required)")
+                   help="approved sender addresses, one per line")
+    t.add_argument("--review", default=None,
+                   help="a review file from 'rank --review'; takes precedence "
+                        "over --senders and needs no transcription")
+    t.add_argument("--engaged", default="engaged.txt",
+                   help="replied-to list, used to flag safeguard overrides "
+                        "(default %(default)s)")
     t.add_argument("--cache", default="headers.jsonl")
     t.add_argument("--manifest", default="trashed-manifest.jsonl",
                    help="written before any mutation; used by 'untrash'")
@@ -2062,7 +2595,7 @@ def main():
                    help="do not open a browser; print the URL and wait")
     # No --host. http.server would bind 0.0.0.0 by default, and a flag to
     # re-enable that is a footgun this tool does not need.
-    _add_rate_args(w, FETCH_DROPPED)
+    _add_rate_args(w, FETCH_DROPPED, FETCH_STATUS)
     w.set_defaults(func=cmd_ui)
 
     u = sub.add_parser("untrash", help="restore messages from a manifest")

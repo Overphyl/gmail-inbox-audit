@@ -1,10 +1,11 @@
 # Design: local web UI
 
-**Status: phases 1 and 2 shipped; 3-5 proposed.** The rate limiter and the
-localhost server exist. `python gmail_audit.py ui` serves preflight and live
-scan progress. Everything from the review table onward - selection, execute,
-undo, incremental scans - is still a design, and the tool remains CLI-only for
-approving and trashing.
+**Status: phases 1, 2 and the goal of 3 have shipped; 4 and 5 are open, and
+4's case is now weaker than it was.** The rate limiter, the localhost server
+and the review file all exist. Selection no longer requires transcription, but
+it happens in a file rather than in the browser - see **Phase 3, reassessed**
+below for why that turned out to be the better artifact, and what it does to
+the phases after it.
 
 ---
 
@@ -13,17 +14,36 @@ approving and trashing.
 Three problems surfaced while running the audit against a real 35,000-message
 inbox. None are cosmetic.
 
-**The scan is invisible.** A full header fetch takes tens of minutes and prints
-batch counters to a log. There is no way to tell whether it is progressing,
-rate-limited, or wedged without inspecting file mtimes and process lists. On a
-real run this led to repeatedly quoting an ETA that was wrong by a factor of
-six.
+**The scan is invisible.** *Fixed.* A full header fetch takes tens of minutes
+and printed batch counters to a log. There was no way to tell whether it was
+progressing, rate-limited, or wedged without inspecting file mtimes and process
+lists. On a real run this led to repeatedly quoting an ETA that was wrong by a
+factor of six.
 
-**Approval happens in a text file.** *Still true - this is phase 3.* The user
-reads a ranked table in the
-terminal, then hand-writes sender addresses into `approved.txt`. It is
-transcription work, it is easy to typo an address into a no-op, and it gives no
-feedback about what the selection actually covers until the dry run.
+A second half of this only surfaced later: the scan also **could not be walked
+away from**. It lived in a foreground process, published nothing, and died with
+its shell, so "how far along is the run in that other window?" had no answer at
+all - and the UI could only report on scans it had started itself.
+`StatusWriter` publishes the same snapshot to a file on the reporter's existing
+tick; `gmail_audit.py status` and the UI both read it.
+
+**Approval happens in a text file.** *Fixed, but not the way this said.* The
+user read a ranked table in the terminal, then hand-wrote sender addresses into
+`approved.txt`. It was transcription work, it was easy to typo an address into
+a no-op, and it gave no feedback about what the selection covered until the dry
+run.
+
+The diagnosis above was off by one, and it is worth recording why, because it
+nearly bought an SPA to solve it. Being a text file was never the problem. The
+problem was that the ranked **output** and the approval **input** were two
+different artifacts, so a human transcribed between them. The file was also, at
+the same time, one of the tool's better safety properties: an auditable record
+of the decision that exists independently of any application state, which is
+why the security section below insists on still writing one.
+
+Making the ranked index and the approval list the same file removes the
+transcription without giving up the artifact. `rank --review` writes it,
+`trash --review` reads it, and a decision costs one character.
 
 **Throughput collapsed under sustained load.** Measured on a real inbox.
 **Every figure below is pre-Phase-1** — they describe the per-request-backoff
@@ -48,11 +68,16 @@ against a real mailbox; do not write in a projected number.
 
 ## Goals
 
-- Make scan progress and rate-limit state legible while it runs.
-- Replace `approved.txt` transcription with direct selection.
+- Make scan progress and rate-limit state legible while it runs. *Shipped.*
+- Make a running scan legible from outside the process that started it, so it
+  can be walked away from. *Shipped; added after the fact.*
+- Remove the `approved.txt` transcription without removing the artifact.
+  *Shipped, as the review file rather than as a table.*
 - Sustain throughput close to the actual quota ceiling instead of far below it.
+  *Shipped in simulation; unmeasured against a real mailbox.*
 - Make repeat runs cheap, so the tool is usable ongoing rather than once.
-- Preserve every existing safety property without exception.
+  *Open - phase 5, and now the most valuable thing left.*
+- Preserve every existing safety property without exception. *Held.*
 
 ## Non-goals
 
@@ -91,14 +116,18 @@ model.
 | GET | `/api/preflight` | auth state, mailbox totals, scope check | shipped |
 | GET | `/api/progress` | fetched/total, observed rate, backoff state | shipped |
 | POST | `/api/scan` | start or resume a scan | shipped |
-| GET | `/api/senders` | ranked index with scores, signals, safeguards | phase 3 |
-| POST | `/api/selection` | persist the approved set | phase 3 |
-| POST | `/api/trash` | execute, token + explicit confirmation required | phase 4 |
-| POST | `/api/untrash` | restore from manifest | phase 4 |
+| GET | `/api/senders` | ranked index with scores, signals, safeguards | phase 3, optional |
+| POST | `/api/selection` | persist the approved set | superseded by the review file |
+| POST | `/api/trash` | execute, token + explicit confirmation required | phase 4, under review |
+| POST | `/api/untrash` | restore from manifest | phase 4, under review |
 
 `test_ui_exposes_no_mutating_route` asserts the bottom four are absent. A phase
 that adds one is expected to update that test deliberately, which is the
 point: the route table cannot grow a deletion path by accident.
+
+`/api/selection` is struck rather than deferred. Persisting the approved set
+through an HTTP endpoint into application state was always a worse artifact
+than a file the user can read, diff and keep; the review file is that file.
 
 ---
 
@@ -222,16 +251,18 @@ reads as `backoff 12s`, not as a frozen counter — and the minutes spent inside
 `list_ids()` before any counter exists read as "enumerating message IDs", which
 is the other way a working scan can look wedged.
 
-**3. Review.** *Phase 3.* The ranked table, sortable and filterable, with safeguard
+**3. Review.** *Phase 3b, optional - the review file covers the goal already.*
+The ranked table, sortable and filterable, with safeguard
 badges. Checkboxes replace `approved.txt`. Bulk selection by predicate ("all
 scoring ≥ 8 with no safeguard"). Per-sender expander showing message dates and
 truncated subjects.
 
-**4. Confirm.** *Phase 4.* Exact per-sender counts. Safeguarded senders listed separately
+**4. Confirm.** *Shipped in the CLI; phase 4 in the browser is under
+review.* Exact per-sender counts. Safeguarded senders listed separately
 and requiring individual override — never swept along by a bulk select.
 
-**5. Execute and undo.** *Phase 4.* Progress, then a persistent Undo backed by
-the manifest.
+**5. Execute and undo.** *Under review; see phase 4.* Progress, then a
+persistent Undo backed by the manifest.
 
 ---
 
@@ -249,8 +280,9 @@ convenience:
   two hundred others.
 - `Subject` never contributes to a score.
 
-On execute, still write `approved.txt` — an auditable record of the decision
-that exists independently of the application's own state.
+On execute, still write an auditable record of the decision that exists
+independently of the application's own state. The review file **is** that
+record now: it is the input, so it cannot drift from what was actually done.
 
 ---
 
@@ -260,9 +292,11 @@ that exists independently of the application's own state.
 |---|---|---|
 | 1 | Rate limiter | **Shipped.** Independent of the UI; fixed the pain being felt and speeds all later testing |
 | 2 | Server, preflight, scan progress | **Shipped.** No deletion path exists; the token, the bind and the escaping landed here |
-| 3 | Review table and selection | Replaces `approved.txt` |
-| 4 | Execute and undo | Token and escaping already landed in phase 2, as required |
-| 5 | Incremental history scans | Makes ongoing use cheap |
+| 2.5 | Status file, `status` subcommand | **Shipped.** Not originally a phase. A scan you cannot walk away from is barely usable, and the UI could only see its own scans |
+| 3 | Selection without transcription | **Shipped as a file, not a table.** `rank --review` / `trash --review`. See below |
+| 3b | Review table in the browser | Optional. A better *view* over the review file; no longer on the critical path |
+| 4 | Execute and undo in the browser | **Under review.** Its main justification was that selection lived in the browser. It no longer does |
+| 5 | Incremental history scans | Open. Makes ongoing use cheap, and is now the highest-value remaining item |
 
 The rate limiter led deliberately. It was the problem actually being felt, it
 carried no UI risk, and every later phase is easier to test when a scan takes
@@ -357,25 +391,112 @@ mailbox-derived string yet — it shows counters and the user's own address.
 Phase 3 is where sender and `Subject` text first reaches a browser, which is
 why the escaping discipline had to be in place before it, not with it.
 
-### Phase 3 — review and selection
+### Phase 2.5 — the status file (shipped, not originally planned)
 
-**Touch:** `score_sender()`, `cmd_rank()` refactored to return rows rather than
-print them, so CLI and UI share one ranking path.
+**Touched:** `StatusWriter`, `read_status()`, `cmd_status()`, and one call
+inside `_progress_reporter()`.
 
-**Done when:** selection in the UI produces exactly the set `cmd_trash` would
-act on given the equivalent `approved.txt`, verified by a test comparing both
-paths against the fixture.
+A one-hour scan that dies with its shell and publishes nothing is barely
+usable, whatever it prints while you watch it. The reporter thread already
+computes a snapshot every two seconds; it now writes that snapshot to
+`fetch-status.json` as well. `gmail_audit.py status` reads it, and so does the
+UI, which is what stops the page reporting "idle" over a fetch running in a
+terminal.
 
-### Phase 4 — execute and undo
+Liveness is judged by the file's **mtime**, never by probing the pid.
+`os.kill(pid, 0)` is the usual idiom and is a trap here: on Windows `os.kill`
+ignores the signal for anything but `CTRL_C_EVENT`/`CTRL_BREAK_EVENT` and calls
+`TerminateProcess`, so the line asking whether the scan is alive would kill it.
+`test_status_never_probes_the_pid` walks the parsed tree for any `kill` call.
+
+**Done when:** a scan started in one terminal is legible from another, and a
+killed scan reads as stopped rather than as permanently running. **Met.**
+
+### Phase 3, reassessed — selection without transcription (shipped as a file)
+
+The original plan was a checkbox table in the browser. What shipped is a file,
+and the difference is worth writing down because the reasoning generalises.
+
+**Touched:** `rank_rows()`, `sender_guard()`, `group_by_sender()`,
+`load_engaged()` extracted from `cmd_rank()`; new `write_review()`,
+`parse_review()`, `load_review_approved()`; `cmd_trash()` gained `--review`.
+
+The `cmd_rank()` refactor this phase always needed - return rows rather than
+print them - happened anyway, and the table, the JSON and the review file are
+now three renderings of one ranking rather than three rankings kept in
+agreement by hand. The test helper that used to reimplement scoring and
+safeguards now calls `rank_rows()` too, so the safeguard tests can no longer
+pass against a copy while the real ranking regresses.
+
+**Done when:** selection produces exactly the set `cmd_trash` would act on
+given the equivalent `approved.txt`, verified by a test comparing both paths
+against the fixture. **Met** by
+`test_review_and_senders_file_produce_the_same_targets`, which is the original
+criterion with the word "UI" removed.
+
+Three properties the file has that the table would have had to re-earn:
+
+- It works over SSH, in `vim`, in a diff, and in a git history.
+- It is the audit trail. The security section already required writing one; it
+  is now the same object as the input, so it cannot drift from what was done.
+- It survives being half-finished. `write_review()` merges by default and there
+  is no overwrite flag, so reviewing across several sittings - or fetching more
+  mail part way through - never discards a decision.
+
+And two safety properties that had to be designed for, not inherited:
+
+- **Every row is written unmarked.** The doc's own risk section says the
+  friction being removed is partly protective, and it is right. A file that
+  arrives pre-marked on two hundred senders and needs only a save is *more*
+  dangerous than typing two hundred lines. `--preselect-score` exists, it is
+  off by default, and it will not mark a safeguarded sender at any threshold.
+- **`cmd_trash` recomputes the safeguards** from the cache instead of reading
+  the `[!]` flag off the file, so deleting the flag by hand removes the marker
+  and not the warning. Overriding one then takes a second deliberate act: the
+  run stops and asks you to type `override`.
+
+One failure mode the file does *not* fix, and which is worth being honest
+about: a transposed domain is still a syntactically valid address, so no parser
+can tell `news@deals.exmaple.com` from a real sender. The file closes it a
+different way - it is generated from the cache, so a marked sender that matches
+nothing is a contradiction rather than a plausible line, and `--review` treats
+it as an error instead of quietly doing less than asked.
+
+### Phase 3b — the review table in the browser (optional)
+
+What the file genuinely cannot do: a per-sender expander showing message dates
+and truncated subjects, so you can see *why* a sender scored 8 before deciding;
+sorting and filtering; a live count of what the current selection covers.
+
+Those are real, and they are the whole remaining case for the table. Build it
+as a **view over the review file** - read it, write it back - not as a second
+selection mechanism with its own state. This is where sender-chosen text and
+`Subject` first reach a browser, so the escaping discipline from phase 2 starts
+being load-bearing rather than precautionary.
+
+### Phase 4 — execute and undo in the browser (under review)
 
 **Touch:** `cmd_trash()`, `cmd_untrash()`, `_trash_one()`.
 
-The token check and output escaping from the security section must land
-**before** this phase adds any mutating endpoint. Not alongside it.
+The token check and output escaping landed in phase 2, as required, so nothing
+blocks this. The question is whether it should be built at all.
 
-**Done when:** a trash run through the UI writes the same manifest the CLI
-writes, Undo restores from it, and tests assert that a request without a valid
-token, or with a foreign `Origin`, is rejected.
+Its original case was that selection happened in the browser, so execution
+should finish there rather than sending the user back to a terminal, and that
+Undo needed to be prominent rather than buried. Selection no longer happens in
+the browser, and `untrash --manifest` already exists. What remains is a
+mutating endpoint - the single largest new risk in this entire design - in
+exchange for not typing one command.
+
+**Recommendation: do not build it, or build it last.** Declining it removes the
+deletion capability from the browser permanently, which turns
+`test_ui_exposes_no_mutating_route` from a phase boundary into a standing
+invariant. That is a better end state than the one this document originally
+planned. Phase 5 is worth more.
+
+**Done when (if built):** a trash run through the UI writes the same manifest
+the CLI writes, Undo restores from it, and tests assert that a request without
+a valid token, or with a foreign `Origin`, is rejected.
 
 ### Phase 5 — incremental scans
 
@@ -419,6 +540,13 @@ observed on one project applies to another.
 than typing two hundred lines into a text file. The friction being removed is
 partly protective friction. This is why safeguard overrides must stay
 individual, and why Undo must be prominent rather than buried.
+
+*Partly answered.* The review file removes the transcription without removing
+the decision: every row arrives unmarked, `--preselect-score` is opt-in and
+cannot touch a safeguarded sender, and an override costs a second deliberate
+act at execute time. The general lesson is that the friction worth keeping is
+the friction of **deciding**, not the friction of **typing**, and the two are
+easy to conflate when the same file carries both.
 
 **Browser as an attack surface.** The CLI rendered untrusted text to a
 terminal. The UI renders it in a JavaScript context holding a deletion

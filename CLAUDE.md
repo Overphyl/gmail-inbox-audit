@@ -10,9 +10,11 @@ spam signals, and bulk-trashes senders the user has explicitly approved. Python
 to the `gws` CLI for Gmail API access.
 
 Everything lives in one module, `gmail_audit.py`, with subcommands: `baseline`,
-`fetch`, `engaged`, `rank`, `trash`, `untrash`, `ui`. The `ui` subcommand
-serves a localhost page with an auth preflight and live scan progress; it is
-phase 2 of `docs/DESIGN-UI.md` and has no mutating endpoint.
+`fetch`, `engaged`, `rank`, `status`, `trash`, `untrash`, `ui`. The `ui`
+subcommand serves a localhost page with an auth preflight and live scan
+progress; it is phase 2 of `docs/DESIGN-UI.md` and has no mutating endpoint.
+`status` reports on a scan running in another terminal by reading the file the
+scan publishes.
 
 ## Hard rules
 
@@ -42,6 +44,25 @@ payload at all. Do not add `format=full` or `format=raw`.
 **Approval is a list, not a threshold.** `cmd_trash` refuses to run without an
 explicit file of approved sender addresses. It must never act on "everything
 scoring above N".
+
+**The review file arrives unmarked.** `write_review` writes every row with `.`.
+`--preselect-score` is opt-in, and it must never mark a safeguarded sender at
+any threshold. The friction being removed is transcription, not judgement: a
+file that arrives pre-marked on two hundred senders and needs only a save is
+more dangerous than typing two hundred lines. Two tests cover this. Do not add
+a "mark everything recommended" default.
+
+**Safeguards are recomputed, never read off the file.** `cmd_trash` calls
+`sender_guard()` against the cache, so deleting a `[!]` by hand removes the
+marker and not the warning, and overriding one still costs a typed `override`
+at execute time. Do not "simplify" this into trusting the flag in the file.
+
+**A marked sender that matches nothing is an error, not a skip.** The review
+file is generated from the cache, so a `t` on a sender with no cached messages
+was typed by hand. A transposed domain is still a syntactically valid address,
+so no parser catches it; refusing the run is what stops it being silent. The
+plain `--senders` path keeps the softer note, because there the list is
+hand-written by design.
 
 **Manifest before mutation.** `cmd_trash` writes every target message ID to
 disk *before* trashing anything, so an interrupted run still leaves a complete
@@ -75,6 +96,22 @@ is what keeps the cache, resumability, drop accounting, circuit breaker and
 reconciliation identical between the two front ends. Do not write a second
 scan loop for the UI.
 
+**One ranking, three renderings.** The table, `--json` and the review file all
+come from `rank_rows()`. The test helper calls it too, so a safeguard test
+cannot pass against a private copy while the real ranking regresses. Do not
+reintroduce scoring logic anywhere else.
+
+**Scan liveness comes from mtime, never from the pid.** `os.kill(pid, 0)` is
+the usual idiom and a trap: on Windows `os.kill` ignores the signal for
+anything but `CTRL_C_EVENT`/`CTRL_BREAK_EVENT` and calls `TerminateProcess`, so
+the line that asks whether the scan is alive would kill it. The pid in the
+status file is for a human to act on. `test_status_never_probes_the_pid` walks
+the parsed tree for any `kill` call, so a comment may name it but code may not.
+
+**The status file is telemetry and must never fail a scan.** Every write is
+wrapped and swallowed, and goes through a temp file plus `os.replace` so a
+reader polling it never sees half a document.
+
 ## Layout
 
 ```
@@ -83,7 +120,7 @@ docs/SETUP.md             OAuth setup, troubleshooting, platform notes
 docs/DESIGN-UI.md         proposed web UI (not implemented; Phase 1 shipped)
 docs/PLAN-RATE-LIMITER.md how the shared rate limiter works, and why
 docs/images/*.svg         hand-authored setup diagrams
-tests/test_audit.py       51 offline tests, no API access needed
+tests/test_audit.py       67 offline tests, no API access needed
 tests/fixtures/           synthetic headers, example.com domains only
 tests/check_diagrams.py   geometric checks on the SVGs
 ```
@@ -103,7 +140,9 @@ tests/check_diagrams.py   geometric checks on the SVGs
 | Per-message header fetch | `get_headers()`, `_safe()` |
 | Scan loop and concurrency | `cmd_fetch()`, `_scan()` |
 | Scoring | `score_sender()`, `BULK_MAILERS`, `NOREPLY`, `PROTECTED` |
-| Ranking and safeguards | `cmd_rank()` |
+| Ranking and safeguards | `rank_rows()`, `sender_guard()`, `cmd_rank()` |
+| The review file, both directions | `write_review()`, `parse_review()`, `load_review_approved()` |
+| Cross-process scan status | `StatusWriter`, `read_status()`, `cmd_status()` |
 | Mutation | `_trash_one()`, `cmd_trash()`, `cmd_untrash()` |
 | Auth preflight and its error classification | `preflight()`, `classify_gws_error()`, `UI_ERRORS`, `UI_HINTS` |
 | UI server, bind guard, request guards, routing | `make_ui_server()`, `_ui_bind_address()`, `_UIHandler` |
