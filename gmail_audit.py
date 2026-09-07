@@ -11,21 +11,32 @@ Subcommands:
   fetch     Pull headers oldest-first into a resumable JSONL cache
   engaged   Build the replied-to address list (false-positive safeguard)
   rank      Score senders and emit the ranked index
+  trash     Trash messages from an explicitly approved sender list
+  untrash   Restore from a manifest
+  ui        Local web UI: preflight and live scan progress (read-only)
 
-This script NEVER trashes, deletes or modifies anything. It only reads.
+The only mutating API calls in this file are messages.trash and
+messages.untrash. Permanent deletion is absent, not merely avoided: it needs
+the https://mail.google.com/ scope, and this tool authenticates with
+gmail.modify, under which Google itself refuses it.
 """
 import argparse
 import collections
 import datetime
+import hmac
 import json
 import os
 import re
 import random
+import secrets
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import webbrowser
 from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 def _find_gws():
     """Resolve the gws binary.
@@ -1175,6 +1186,784 @@ def _safe_mutate(fn, msg_id, sanitize):
 
 
 # -------------------------------------------------------------------- main
+# ------------------------------------------------------------------- web ui
+# Phase 2 of docs/DESIGN-UI.md: a localhost server that reports preflight
+# state and live scan progress.
+#
+# There is deliberately NO mutating endpoint in this phase. The design orders
+# the token check and the escaping discipline BEFORE any endpoint that can
+# trash mail, so both land here, guarding a surface that cannot yet delete
+# anything. Landing them alongside the deletion path would mean the first
+# version of that path is the one being tested.
+#
+# A localhost server that will one day trash mail is a different risk profile
+# from a CLI, so four properties hold at once:
+#   1. loopback bind, asserted rather than defaulted (_ui_bind_address)
+#   2. a per-launch token on EVERY request, page included
+#   3. Host and Origin allowlists, which is what defeats DNS rebinding
+#   4. no CORS headers, ever, so a foreign page cannot read a response
+
+UI_HOST = "127.0.0.1"
+UI_PORT = 8765
+UI_LOOPBACK = ("127.0.0.1", "localhost", "::1")
+UI_MAX_CONCURRENCY = 16  # see README: above this the API drops messages
+
+# The failure modes of `gws gmail users getProfile`, ordered most specific
+# first. The literal strings come from the troubleshooting index in
+# docs/SETUP.md; the looser status-code alternatives are the fallback for a
+# gws that words things differently. Word boundaries on the numbers for the
+# same reason THROTTLE has them: message IDs are lowercase hex and a bare 403
+# would match inside one.
+#
+# Distinguishing these two cases is the whole point of preflight. `gws auth
+# status` reports the scopes that were REQUESTED, not the ones Google
+# granted, so "authenticated but with no Gmail scope" looks identical to a
+# healthy install until a real call is made - after the user has waited an
+# hour for a scan that could never have worked.
+UI_ERRORS = (
+    ("no_gws", re.compile(
+        r"unrecognized subcommand|command not found|no such file or directory|"
+        r"is not recognized as|\bENOENT\b|WinError 2", re.I)),
+    ("bad_params", re.compile(
+        r"invalid --params json|key must be a string", re.I)),
+    ("insufficient_scope", re.compile(
+        r"insufficient authentication scopes|insufficientPermissions|"
+        r"ACCESS_TOKEN_SCOPE_INSUFFICIENT|insufficient[_ ]scope", re.I)),
+    ("unauthenticated", re.compile(
+        r"no credentials provided|access denied\. no credentials|"
+        r"invalid[_ ]grant|\bUNAUTHENTICATED\b|\b401\b|"
+        r"token has been expired or revoked|gws auth login", re.I)),
+    ("insufficient_scope", re.compile(
+        r"\b403\b|PERMISSION_DENIED|forbidden", re.I)),
+)
+
+UI_HINTS = {
+    "no_gws": "gws is not on PATH, or this shell predates the install. Open a "
+              "new terminal; on Windows set GWS_BIN to the real .exe. "
+              "SETUP.md > Troubleshooting.",
+    "bad_params": "The shell mangled the JSON argument - PowerShell strips "
+                  "inner quotes. SETUP.md > Platform notes.",
+    "unauthenticated": "No usable credentials. Run: gws auth login --scopes "
+                       "https://www.googleapis.com/auth/gmail.modify,openid,"
+                       "https://www.googleapis.com/auth/userinfo.email",
+    "insufficient_scope": "Authenticated, but the token carries no Gmail "
+                          "scope. `gws auth status` will not show this - it "
+                          "reports requested scopes, not granted ones. "
+                          "SETUP.md > Request had insufficient authentication "
+                          "scopes.",
+    "error": "Unexpected failure. The raw message is above; SETUP.md indexes "
+             "troubleshooting by literal error text.",
+}
+
+
+def classify_gws_error(text):
+    """Map a gws failure to a preflight status. Pure, so it is testable."""
+    s = text or ""
+    for status, pattern in UI_ERRORS:
+        if pattern.search(s):
+            return status
+    return "error"
+
+
+def preflight(sanitize=None):
+    """Verify auth with a REAL API call, and say which way it failed.
+
+    Retries are deliberately shallow: preflight answers a question, and a
+    user staring at a blank panel should not wait out six backoffs to learn
+    that they are not logged in.
+    """
+    params = json.dumps({"userId": "me"})
+    try:
+        out = gws(["gmail", "users", "getProfile", "--params", params],
+                  sanitize, retries=1, throttle_retries=2)
+    except OSError as e:
+        # subprocess could not exec the binary at all.
+        return {"ok": False, "status": "no_gws", "detail": str(e)[:400],
+                "hint": UI_HINTS["no_gws"]}
+    except Exception as e:
+        detail = str(e)[:400]
+        status = classify_gws_error(detail)
+        return {"ok": False, "status": status, "detail": detail,
+                "hint": UI_HINTS.get(status, UI_HINTS["error"])}
+    try:
+        prof = json.loads(out)
+    except json.JSONDecodeError:
+        return {"ok": False, "status": "error", "detail": out[:400],
+                "hint": UI_HINTS["error"]}
+    return {
+        "ok": True,
+        "status": "ok",
+        "email": prof.get("emailAddress", ""),
+        "messages_total": prof.get("messagesTotal"),
+        "threads_total": prof.get("threadsTotal"),
+        # Stored for phase 5: an incremental rescan starts from this.
+        "history_id": prof.get("historyId"),
+        "detail": "",
+        "hint": "",
+    }
+
+
+class ScanState:
+    """What the UI knows about the background scan.
+
+    Deliberately thin. The scan's own counters live in FetchProgress, which
+    already returns a plain dict; this only tracks the lifecycle around it,
+    because a scan spends its first minutes inside list_ids() with no
+    counters to report yet.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.status = "idle"   # idle | running | done | failed | aborted
+        self.error = None
+        self.query = None
+        self.started = None
+        self.finished = None
+
+    def begin(self, query):
+        """Claim the scan slot. False if one is already running."""
+        with self._lock:
+            if self.status == "running":
+                return False
+            self.status = "running"
+            self.error = None
+            self.query = query
+            self.started = time.time()
+            self.finished = None
+            return True
+
+    def end(self, status, error=None):
+        with self._lock:
+            self.status = status
+            self.error = error
+            self.finished = time.time()
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "status": self.status,
+                "error": self.error,
+                "query": self.query,
+                "started": self.started,
+                "finished": self.finished,
+            }
+
+
+def _ui_scan_args(base, query, concurrency, limit):
+    """Build the namespace cmd_fetch expects from the UI's request.
+
+    The UI is a front-end over the same function, not a second scan path, so
+    everything the CLI takes is carried through unchanged and only the three
+    fields the page exposes are overridden.
+    """
+    return argparse.Namespace(
+        sanitize=getattr(base, "sanitize", None),
+        query=query,
+        cache=getattr(base, "cache", "headers.jsonl"),
+        batch=getattr(base, "batch", 1000),
+        concurrency=concurrency,
+        limit=limit,
+        dropped=getattr(base, "dropped", FETCH_DROPPED),
+    )
+
+
+def _ui_run_scan(state, ns):
+    """cmd_fetch on a background thread, with its exits turned into state.
+
+    cmd_fetch reports an aborted or interrupted run with sys.exit(), which in
+    a thread is a silently swallowed SystemExit. The message it carries is
+    exactly what the page needs to show, so catch it rather than lose it.
+    """
+    global PROGRESS
+    PROGRESS = None
+    try:
+        cmd_fetch(ns)
+    except SystemExit as e:
+        msg = str(e.code) if e.code not in (None, 0) else None
+        state.end("aborted" if msg else "done", msg)
+    except Exception as e:  # noqa: BLE001 - a dead thread must not be silent
+        state.end("failed", "{}: {}".format(type(e).__name__, e)[:400])
+    else:
+        state.end("done")
+
+
+class _UIHandler(BaseHTTPRequestHandler):
+    """Every request passes the same four guards before it routes anywhere."""
+
+    server_version = "gmail-audit"
+    sys_version = ""
+
+    def log_message(self, fmt, *args):
+        pass  # the live progress line owns stderr
+
+    # ------------------------------------------------------------- guards
+    def _allowed_hosts(self):
+        port = self.server.server_address[1]
+        return {"127.0.0.1:{}".format(port), "localhost:{}".format(port),
+                "[::1]:{}".format(port)}
+
+    def _allowed_origins(self):
+        return {"http://" + h for h in self._allowed_hosts()}
+
+    def _guard(self):
+        """Return an error string, or None to proceed."""
+        # A rebinding attack reaches 127.0.0.1 while the browser still sends
+        # the attacker's name in Host. An allowlist is what breaks that.
+        if (self.headers.get("Host") or "").lower() not in self._allowed_hosts():
+            return "bad Host"
+        origin = self.headers.get("Origin")
+        # Absent on same-origin navigation and on same-origin GETs; present
+        # and foreign is the case that matters.
+        if origin is not None and origin.lower() not in self._allowed_origins():
+            return "bad Origin"
+        if not self._token_ok():
+            return "bad token"
+        return None
+
+    def _token_ok(self):
+        want = self.server.ui_token
+        got = self.headers.get("X-Audit-Token")
+        if got is None:
+            got = urllib.parse.parse_qs(
+                urllib.parse.urlparse(self.path).query
+            ).get("t", [""])[0]
+        # Bytes, not str: compare_digest raises TypeError on a non-ASCII
+        # str, and the query string is attacker-supplied - a 500 there would
+        # be a denial of service on the page itself.
+        return hmac.compare_digest(
+            str(got).encode("utf-8", "replace"), str(want).encode("utf-8")
+        )
+
+    # ------------------------------------------------------------ replies
+    def _send(self, code, body, ctype):
+        raw = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype + "; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        # No CORS allow-origin header is emitted anywhere in this file, and
+        # a test asserts the absence: without one a foreign page may fire a
+        # request but can never read the answer.
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        # The page loads nothing and talks to nobody but this server, so a
+        # future injected <script> would have no channel to send anything out.
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; script-src 'unsafe-inline'; "
+            "style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; "
+            "form-action 'none'; frame-ancestors 'none'",
+        )
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _json(self, code, obj):
+        self._send(code, json.dumps(obj), "application/json")
+
+    # ------------------------------------------------------------ routing
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        bad = self._guard()
+        if bad:
+            # The page gets prose it can act on; the SPA's fetch() gets JSON,
+            # because a text/plain body would surface as a parse error and
+            # read like the server had died rather than like a stale token.
+            if path.startswith("/api/"):
+                self._json(403, {"error": bad})
+            else:
+                self._send(403, UI_FORBIDDEN, "text/plain")
+            return
+        if path == "/":
+            self._send(200, UI_HTML, "text/html")
+        elif path == "/api/preflight":
+            self._json(200, preflight(getattr(self.server.ui_args, "sanitize", None)))
+        elif path == "/api/progress":
+            self._json(200, self._progress())
+        else:
+            self._json(404, {"error": "no such endpoint"})
+
+    def do_POST(self):
+        bad = self._guard()
+        if bad:
+            self._json(403, {"error": bad})
+            return
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/api/scan":
+            self._start_scan()
+        else:
+            self._json(404, {"error": "no such endpoint"})
+
+    # Anything else - including the OPTIONS preflight a cross-origin fetch
+    # would send - is refused rather than answered.
+    def do_OPTIONS(self):
+        self._send(405, "", "text/plain")
+
+    def do_PUT(self):
+        self._send(405, "", "text/plain")
+
+    def do_DELETE(self):
+        self._send(405, "", "text/plain")
+
+    # ----------------------------------------------------------- handlers
+    def _progress(self):
+        scan = self.server.ui_scan.snapshot()
+        progress = PROGRESS.snapshot() if PROGRESS is not None else None
+        # list_ids() runs before any counter exists, and on a large mailbox
+        # that is minutes. Naming the phase is the difference between "still
+        # enumerating" and "wedged".
+        if scan["status"] == "running":
+            scan["phase"] = "listing" if progress is None else "fetching"
+        else:
+            scan["phase"] = scan["status"]
+        return {
+            "scan": scan,
+            "progress": progress,
+            "limiter": LIMITER.stats() if LIMITER is not None else None,
+        }
+
+    def _read_json(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return {}
+        if n <= 0 or n > 64 * 1024:
+            return {}
+        try:
+            return json.loads(self.rfile.read(n).decode("utf-8")) or {}
+        except (ValueError, UnicodeDecodeError):
+            return {}
+
+    def _start_scan(self):
+        body = self._read_json()
+        query = str(body.get("query") or "in:inbox").strip() or "in:inbox"
+        try:
+            # Explicit None checks, not `or`: a posted 0 is a wrong value the
+            # user should be told about, not a falsy one that silently
+            # becomes the default.
+            raw_c, raw_l = body.get("concurrency"), body.get("limit")
+            concurrency = 12 if raw_c is None else int(raw_c)
+            limit = 0 if raw_l is None else int(raw_l)
+        except (TypeError, ValueError):
+            self._json(400, {"error": "concurrency and limit must be integers"})
+            return
+        if concurrency < 1 or concurrency > UI_MAX_CONCURRENCY:
+            # Refused rather than clamped. Above 16 the API drops messages,
+            # which undercounts senders and corrupts the ranking; silently
+            # correcting the number would hide that the user asked for it.
+            self._json(400, {"error": "concurrency must be 1-{} - above that "
+                                      "the API drops messages and the ranking "
+                                      "undercounts".format(UI_MAX_CONCURRENCY)})
+            return
+        if limit < 0:
+            self._json(400, {"error": "limit must be >= 0"})
+            return
+        state = self.server.ui_scan
+        if not state.begin(query):
+            self._json(409, {"error": "a scan is already running"})
+            return
+        ns = _ui_scan_args(self.server.ui_args, query, concurrency, limit)
+        t = threading.Thread(target=_ui_run_scan, args=(state, ns))
+        t.daemon = True
+        t.start()
+        self._json(202, {"started": True, "query": query})
+
+
+def _ui_bind_address(host):
+    """Refuse to bind anything but loopback.
+
+    http.server binds 0.0.0.0 by default. Left alone that would put a scan
+    trigger - and, from phase 4, mail deletion - on every interface of the
+    machine. There is no flag to override this: absent capability beats
+    remembered intent.
+    """
+    if host not in UI_LOOPBACK:
+        raise ValueError(
+            "refusing to bind {!r}: this server is loopback-only".format(host)
+        )
+    return host
+
+
+def make_ui_server(port=UI_PORT, token=None, args=None, host=UI_HOST):
+    httpd = ThreadingHTTPServer((_ui_bind_address(host), port), _UIHandler)
+    httpd.daemon_threads = True
+    httpd.ui_token = token or secrets.token_urlsafe(32)
+    httpd.ui_args = args
+    httpd.ui_scan = ScanState()
+    return httpd
+
+
+def cmd_ui(a):
+    # Per launch, and never written to disk: the terminal that started the
+    # server is the only place it exists besides the browser's address bar.
+    token = secrets.token_urlsafe(32)
+    try:
+        httpd = make_ui_server(a.port, token, a)
+    except OSError as e:
+        sys.exit(
+            "cannot listen on 127.0.0.1:{}: {}\n"
+            "Something else is using that port. Pick another with --port, or "
+            "--port 0\nto let the OS choose one.".format(a.port, e)
+        )
+    port = httpd.server_address[1]
+    url = "http://{}:{}/?t={}".format(UI_HOST, port, token)
+    print("gmail-audit ui on {}".format(url))
+    print("  loopback only, token required on every request")
+    print("  this phase can start a scan; it cannot trash anything")
+    print("  Ctrl-C to stop")
+    if not a.no_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass  # a headless box is not a failure; the URL is printed above
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopping", file=sys.stderr)
+        if LIMITER is not None:
+            LIMITER.shutdown()  # workers drain instead of sleeping out a wait
+        if PROGRESS is not None:
+            PROGRESS.abort("interrupted")
+    finally:
+        httpd.server_close()
+
+
+# --------------------------------------------------------------- the page
+# One file, inlined CSS and JS, no network fetch of any kind - which is what
+# lets the Content-Security-Policy above be 'none' for everything except this
+# server.
+#
+# Nothing below writes markup - every dynamic value goes in as text, and
+# test_ui_page_never_writes_markup enforces it by name. This is the same
+# reasoning that keeps Subject out of score_sender(): header text is chosen by
+# the sender, and a browser executes what a terminal merely printed. Phase 3
+# renders Subject and From on this page while it holds a token; the discipline
+# has to already be in place by then, not arrive with the feature that needs
+# it.
+UI_FORBIDDEN = (
+    "403 - this server requires the per-launch token.\n\n"
+    "Open the URL printed by `python gmail_audit.py ui`. The token is\n"
+    "generated per launch and is not written to disk, so a stale bookmark\n"
+    "will not work.\n"
+)
+
+UI_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>gmail-audit</title>
+<style>
+  :root {
+    --bg: #fbfbfa; --fg: #1c1c1a; --dim: #6b6b66; --line: #e2e2dd;
+    --card: #ffffff; --ok: #1a7f45; --warn: #a05a00; --bad: #b3261e;
+    --accent: #2b5fd9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16161a; --fg: #e8e8e4; --dim: #9a9a94; --line: #2e2e34;
+      --card: #1e1e23; --ok: #4ec97e; --warn: #e0a13c; --bad: #ef6c60;
+      --accent: #7aa2f7;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          Helvetica, Arial, sans-serif;
+  }
+  main { max-width: 820px; margin: 0 auto; padding: 28px 20px 60px; }
+  h1 { font-size: 19px; margin: 0 0 2px; letter-spacing: -0.01em; }
+  h2 { font-size: 13px; margin: 0 0 14px; text-transform: uppercase;
+       letter-spacing: 0.08em; color: var(--dim); font-weight: 600; }
+  .sub { color: var(--dim); margin: 0 0 26px; font-size: 13px; }
+  section {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 18px 20px; margin-bottom: 18px;
+  }
+  .row { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-end; }
+  label { display: block; font-size: 12px; color: var(--dim); margin-bottom: 4px; }
+  input {
+    font: inherit; padding: 6px 9px; border: 1px solid var(--line);
+    border-radius: 6px; background: var(--bg); color: var(--fg);
+  }
+  input[type=number] { width: 84px; }
+  #query { min-width: 240px; }
+  button {
+    font: inherit; font-weight: 550; padding: 7px 15px; border-radius: 6px;
+    border: 1px solid var(--accent); background: var(--accent); color: #fff;
+    cursor: pointer;
+  }
+  button.ghost { background: transparent; color: var(--fg);
+                 border-color: var(--line); }
+  button[disabled] { opacity: 0.45; cursor: default; }
+  .grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
+    gap: 14px 18px; margin-top: 4px;
+  }
+  .k { font-size: 11px; color: var(--dim); text-transform: uppercase;
+       letter-spacing: 0.06em; }
+  .v { font-size: 17px; font-variant-numeric: tabular-nums; margin-top: 1px; }
+  .bar { height: 7px; background: var(--line); border-radius: 4px;
+         overflow: hidden; margin: 16px 0 4px; }
+  .bar > div { height: 100%; width: 0; background: var(--accent);
+               transition: width 0.4s ease; }
+  .note { color: var(--dim); font-size: 12px; margin-top: 10px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+          font-size: 12px; }
+  .raw { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+         font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+  .barline { display: flex; align-items: baseline; justify-content: flex-end;
+             gap: 8px; margin: 6px 0 16px; font-variant-numeric: tabular-nums; }
+  .status { font-weight: 600; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  .banner { border-left: 3px solid var(--line); padding: 8px 0 8px 12px;
+            margin-top: 12px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>gmail-audit</h1>
+  <p class="sub">Headers only. Loopback only. This page cannot trash
+    anything &mdash; it reads and it scans.</p>
+
+  <section>
+    <h2>1 &middot; Preflight</h2>
+    <div class="row">
+      <button id="pf-btn" class="ghost" type="button">Re-check</button>
+      <span id="pf-status" class="status">checking&hellip;</span>
+    </div>
+    <div id="pf-ok" hidden>
+      <div class="grid">
+        <div><div class="k">account</div><div class="v" id="pf-email">&mdash;</div></div>
+        <div><div class="k">messages</div><div class="v" id="pf-messages">&mdash;</div></div>
+        <div><div class="k">threads</div><div class="v" id="pf-threads">&mdash;</div></div>
+      </div>
+    </div>
+    <div id="pf-bad" class="banner" hidden>
+      <div class="raw" id="pf-detail"></div>
+      <div class="note" id="pf-hint"></div>
+    </div>
+    <p class="note">A real getProfile call, not <span class="mono">gws auth status</span>
+      &mdash; which reports the scopes that were requested, not the ones
+      Google granted.</p>
+  </section>
+
+  <section>
+    <h2>2 &middot; Scan</h2>
+    <div class="row">
+      <div>
+        <label for="query">query</label>
+        <input id="query" type="text" value="in:inbox" spellcheck="false">
+      </div>
+      <div>
+        <label for="concurrency">concurrency</label>
+        <input id="concurrency" type="number" min="1" max="16" value="12">
+      </div>
+      <div>
+        <label for="limit">limit (0 = all)</label>
+        <input id="limit" type="number" min="0" value="0">
+      </div>
+      <button id="scan-btn" type="button">Start scan</button>
+      <span id="scan-status" class="status">idle</span>
+    </div>
+    <div class="bar"><div id="bar"></div></div>
+    <div class="barline">
+      <span class="k">limiter</span><span class="mono" id="p-limit">&mdash;</span>
+    </div>
+    <div class="grid">
+      <div><div class="k">fetched</div><div class="v" id="p-done">&mdash;</div></div>
+      <div><div class="k">rate</div><div class="v" id="p-rate">&mdash;</div></div>
+      <div><div class="k">average</div><div class="v" id="p-avg">&mdash;</div></div>
+      <div><div class="k">eta</div><div class="v" id="p-eta">&mdash;</div></div>
+      <div><div class="k">dropped</div><div class="v" id="p-drops">&mdash;</div></div>
+    </div>
+    <div id="scan-error" class="banner raw" hidden></div>
+    <p class="note">Resumable: re-running skips whatever is
+      already in the cache. Above concurrency 16 the API drops messages, which
+      undercounts senders and corrupts the ranking &mdash; so the server
+      refuses it rather than quietly lowering it.</p>
+  </section>
+
+  <p class="note">Ranking and selection arrive in phase 3; until then use
+    <span class="mono">python gmail_audit.py rank</span>.</p>
+</main>
+<script>
+(function () {
+  "use strict";
+  var TOKEN = new URLSearchParams(window.location.search).get("t") || "";
+
+  function $(id) { return document.getElementById(id); }
+  // The only way text reaches this page, and deliberately the only one:
+  // every value below ultimately comes from a mailbox, and a browser
+  // executes what a terminal merely printed.
+  function put(id, value) { $(id).textContent = value; }
+  function show(id, on) { $(id).hidden = !on; }
+  function cls(id, name) { $(id).className = "status " + (name || ""); }
+
+  function api(path, options) {
+    options = options || {};
+    options.headers = Object.assign(
+      { "X-Audit-Token": TOKEN }, options.headers || {}
+    );
+    options.cache = "no-store";
+    return fetch(path, options).then(function (r) {
+      return r.json().then(function (body) {
+        return { code: r.status, body: body };
+      });
+    });
+  }
+
+  function num(n) {
+    return (n === null || n === undefined) ? "—" : n.toLocaleString();
+  }
+
+  function eta(seconds) {
+    if (!seconds || seconds <= 0) { return "—"; }
+    var s = Math.round(seconds);
+    if (s >= 3600) {
+      return Math.floor(s / 3600) + "h" +
+             String(Math.floor((s % 3600) / 60)).padStart(2, "0") + "m";
+    }
+    if (s >= 60) {
+      return Math.floor(s / 60) + "m" + String(s % 60).padStart(2, "0") + "s";
+    }
+    return s + "s";
+  }
+
+  // ------------------------------------------------------------ preflight
+  var PF_LABEL = {
+    ok: "authenticated",
+    unauthenticated: "not authenticated",
+    insufficient_scope: "authenticated, but no Gmail scope",
+    no_gws: "gws not found",
+    bad_params: "the shell mangled the JSON argument",
+    error: "check failed"
+  };
+
+  function preflight() {
+    $("pf-btn").disabled = true;
+    put("pf-status", "checking…");
+    cls("pf-status", "");
+    return api("/api/preflight").then(function (r) {
+      var d = r.body || {};
+      put("pf-status", PF_LABEL[d.status] || d.status || "unknown");
+      cls("pf-status", d.ok ? "ok" : "bad");
+      show("pf-ok", !!d.ok);
+      show("pf-bad", !d.ok);
+      if (d.ok) {
+        put("pf-email", d.email || "—");
+        put("pf-messages", num(d.messages_total));
+        put("pf-threads", num(d.threads_total));
+      } else {
+        put("pf-detail", d.detail || "");
+        put("pf-hint", d.hint || "");
+      }
+    }).catch(function (e) {
+      put("pf-status", "could not reach the local server");
+      cls("pf-status", "bad");
+      show("pf-bad", true);
+      put("pf-detail", String(e));
+      put("pf-hint", "The server may have been stopped, or the token in this "
+                     + "URL is stale. Restart with: python gmail_audit.py ui");
+    }).then(function () { $("pf-btn").disabled = false; });
+  }
+
+  // ----------------------------------------------------------------- scan
+  var PHASE_LABEL = {
+    idle: "idle",
+    listing: "enumerating message IDs…",
+    fetching: "fetching headers",
+    done: "complete",
+    aborted: "aborted",
+    failed: "failed"
+  };
+  var timer = null;
+
+  function startScan() {
+    $("scan-btn").disabled = true;
+    show("scan-error", false);
+    api("/api/scan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        query: $("query").value,
+        concurrency: Number($("concurrency").value),
+        limit: Number($("limit").value)
+      })
+    }).then(function (r) {
+      if (r.code !== 202) {
+        show("scan-error", true);
+        put("scan-error", (r.body && r.body.error) || ("HTTP " + r.code));
+        $("scan-btn").disabled = false;
+        return;
+      }
+      poll();
+    }).catch(function (e) {
+      show("scan-error", true);
+      put("scan-error", String(e));
+      $("scan-btn").disabled = false;
+    });
+  }
+
+  function render(d) {
+    var scan = d.scan || {};
+    var p = d.progress;
+    var lim = d.limiter;
+    var running = scan.status === "running";
+
+    put("scan-status", PHASE_LABEL[scan.phase] || scan.phase || "idle");
+    cls("scan-status", running ? "warn"
+        : (scan.status === "done" ? "ok"
+        : (scan.status === "idle" ? "" : "bad")));
+    $("scan-btn").disabled = running;
+
+    if (scan.error) {
+      show("scan-error", true);
+      put("scan-error", scan.error);
+    }
+
+    if (p) {
+      var pct = p.total ? (100 * p.done / p.total) : 0;
+      $("bar").style.width = Math.min(100, pct).toFixed(1) + "%";
+      put("p-done", num(p.done) + " / " + num(p.total)
+                    + "  (" + pct.toFixed(1) + "%)");
+      put("p-rate", p.rate.toFixed(1) + " msg/s");
+      put("p-avg", p.avg_rate.toFixed(1) + " msg/s");
+      put("p-eta", eta(p.eta));
+      // Never hidden behind a fold: a fast run that drops messages is a
+      // failed run, not a partial success.
+      put("p-drops", num(p.dropped));
+      $("p-drops").className = "v" + (p.dropped ? " bad" : "");
+    }
+    put("p-limit", lim ? (lim.rate.toFixed(1) + "/s " + lim.state
+                          + (lim.throttles ? "  thr " + lim.throttles : ""))
+                       : "off");
+    return running;
+  }
+
+  function poll() {
+    if (timer) { clearTimeout(timer); timer = null; }
+    api("/api/progress").then(function (r) {
+      var running = render(r.body || {});
+      timer = setTimeout(poll, running ? 1000 : 4000);
+    }).catch(function () {
+      timer = setTimeout(poll, 4000);
+    });
+  }
+
+  $("pf-btn").addEventListener("click", preflight);
+  $("scan-btn").addEventListener("click", startScan);
+  preflight();
+  poll();
+})();
+</script>
+</body>
+</html>
+"""
+
+
 def _add_rate_args(sub, dropped_default=None):
     """The pacing knobs. Shared by every subcommand that hits the API in bulk."""
     sub.add_argument("--rate", type=float, default=0.0,
@@ -1263,6 +2052,18 @@ def main():
                    help="skip the per-batch confirmation prompt")
     _add_rate_args(t)
     t.set_defaults(func=cmd_trash)
+
+    w = sub.add_parser("ui", help="local web UI: preflight and scan progress")
+    w.add_argument("--port", type=int, default=UI_PORT,
+                   help="loopback port (default %(default)s); 0 picks a free one")
+    w.add_argument("--cache", default="headers.jsonl")
+    w.add_argument("--batch", type=int, default=1000)
+    w.add_argument("--no-browser", action="store_true",
+                   help="do not open a browser; print the URL and wait")
+    # No --host. http.server would bind 0.0.0.0 by default, and a flag to
+    # re-enable that is a footgun this tool does not need.
+    _add_rate_args(w, FETCH_DROPPED)
+    w.set_defaults(func=cmd_ui)
 
     u = sub.add_parser("untrash", help="restore messages from a manifest")
     u.add_argument("--manifest", default="trashed-manifest.jsonl")

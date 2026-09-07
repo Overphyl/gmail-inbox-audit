@@ -1,8 +1,10 @@
 # Design: local web UI
 
-**Status: proposed, not implemented.** This document describes a planned
-browser-based interface for the audit. Nothing here exists yet; the tool today
-is CLI-only.
+**Status: phases 1 and 2 shipped; 3-5 proposed.** The rate limiter and the
+localhost server exist. `python gmail_audit.py ui` serves preflight and live
+scan progress. Everything from the review table onward - selection, execute,
+undo, incremental scans - is still a design, and the tool remains CLI-only for
+approving and trashing.
 
 ---
 
@@ -17,7 +19,8 @@ rate-limited, or wedged without inspecting file mtimes and process lists. On a
 real run this led to repeatedly quoting an ETA that was wrong by a factor of
 six.
 
-**Approval happens in a text file.** The user reads a ranked table in the
+**Approval happens in a text file.** *Still true - this is phase 3.* The user
+reads a ranked table in the
 terminal, then hand-writes sender addresses into `approved.txt`. It is
 transcription work, it is easy to typo an address into a no-op, and it gives no
 feedback about what the selection actually covers until the dry run.
@@ -65,7 +68,7 @@ against a real mailbox; do not write in a projected number.
 
 `python gmail_audit.py ui` starts a `ThreadingHTTPServer`, opens a browser, and
 serves a single-page app. The scan runs on a background thread. The page polls
-a progress endpoint.
+a progress endpoint. **Shipped in phase 2**, minus the endpoints marked below.
 
 ```
   browser (localhost only)
@@ -83,15 +86,19 @@ model.
 
 ### Endpoints
 
-| Method | Path | Purpose |
-|---|---|---|
-| GET | `/api/preflight` | auth state, mailbox totals, scope check |
-| GET | `/api/progress` | fetched/total, observed rate, backoff state |
-| POST | `/api/scan` | start or resume a scan |
-| GET | `/api/senders` | ranked index with scores, signals, safeguards |
-| POST | `/api/selection` | persist the approved set |
-| POST | `/api/trash` | execute, token + explicit confirmation required |
-| POST | `/api/untrash` | restore from manifest |
+| Method | Path | Purpose | Status |
+|---|---|---|---|
+| GET | `/api/preflight` | auth state, mailbox totals, scope check | shipped |
+| GET | `/api/progress` | fetched/total, observed rate, backoff state | shipped |
+| POST | `/api/scan` | start or resume a scan | shipped |
+| GET | `/api/senders` | ranked index with scores, signals, safeguards | phase 3 |
+| POST | `/api/selection` | persist the approved set | phase 3 |
+| POST | `/api/trash` | execute, token + explicit confirmation required | phase 4 |
+| POST | `/api/untrash` | restore from manifest | phase 4 |
+
+`test_ui_exposes_no_mutating_route` asserts the bottom four are absent. A phase
+that adds one is expected to update that test deliberately, which is the
+point: the route table cannot grow a deletion path by accident.
 
 ---
 
@@ -101,11 +108,19 @@ A localhost server that can delete mail is a materially different risk profile
 from a CLI. Three requirements, all mandatory before any mutating endpoint
 exists.
 
+**All three shipped in phase 2**, guarding a surface that cannot yet delete
+anything. That ordering was deliberate: landing them alongside the deletion
+path would have meant the first version of that path was the one being tested.
+
 ### Bind to 127.0.0.1 explicitly
 
 `http.server` binds `0.0.0.0` by default. Left alone, that exposes mail
 deletion to every device on the network. Bind the loopback interface
 explicitly and assert it in a test.
+
+Shipped as `_ui_bind_address()`, which *raises* on anything but loopback, and
+there is no `--host` flag to reach it with. Absent capability beats remembered
+intent. `test_ui_binds_loopback_only` covers both halves.
 
 ### Per-launch token on every mutating request
 
@@ -114,10 +129,18 @@ Without authentication, a hostile page could trigger deletions silently while
 the user is on an unrelated site.
 
 - Random token generated per launch, carried in the URL the tool opens
-- Required on every state-changing request
+- Required on every request, not only the state-changing ones: a GET that
+  triggers a real API call spends quota, and the page itself is token-gated so
+  a stale bookmark cannot reach it
 - Never written to disk
 - Validate `Origin` and `Host` headers to defeat DNS rebinding
 - Emit no CORS headers
+
+Also shipped: a `Content-Security-Policy` of `default-src 'none'` with
+`connect-src 'self'`. The page loads nothing from anywhere - no CDN, no font,
+no analytics - so an injected `<script>` in a later phase would have no channel
+to send anything out. `test_ui_page_never_writes_markup` asserts the page
+contains no external URL at all, which is what keeps that policy true.
 
 ### Escape all header-derived text
 
@@ -126,9 +149,15 @@ printed `Subject` to a terminal. A browser executes it. `Subject` is
 attacker-controlled — a sender chooses its contents — so a crafted subject line
 becomes stored XSS in a page that holds a token capable of deleting mail.
 
-- All header-derived values rendered via `textContent`, never `innerHTML`
+- All header-derived values rendered via `textContent`, never as markup
 - No `dangerouslySetInnerHTML`-equivalent anywhere in the SPA
 - A test asserting no template path emits raw header text
+
+Shipped: the page has exactly one text-setting helper, and
+`test_ui_page_never_writes_markup` fails on any markup-writing API appearing in
+`UI_HTML`. It bans the literal strings, so the test caught them in this
+document's own implementation comments while phase 2 was being written - which
+is roughly the level of paranoia intended.
 
 This is the same reasoning that already keeps `Subject` out of the scoring
 function: it is data, from an untrusted party, and must never become code or
@@ -182,25 +211,27 @@ one-off.
 
 ## Screens
 
-**1. Preflight.** Calls `getProfile` and reports auth state plainly. Catches
-the scope trap — where `gws auth status` reports scopes the token does not
-actually have — *before* the user waits an hour for a scan that cannot work.
-Links to `SETUP.md` on failure.
+**1. Preflight.** *Shipped.* Calls `getProfile` and reports auth state plainly.
+Catches the scope trap — where `gws auth status` reports scopes the token does
+not actually have — *before* the user waits an hour for a scan that cannot
+work. Points at the relevant `SETUP.md` section on failure.
 
-**2. Scan.** Live progress, measured rate, ETA derived from observed
+**2. Scan.** *Shipped.* Live progress, measured rate, ETA derived from observed
 throughput rather than a benchmark, and explicit rate-limit state. A stall
-should read as "waiting on quota, resuming in 12s", not as a frozen counter.
+reads as `backoff 12s`, not as a frozen counter — and the minutes spent inside
+`list_ids()` before any counter exists read as "enumerating message IDs", which
+is the other way a working scan can look wedged.
 
-**3. Review.** The ranked table, sortable and filterable, with safeguard
+**3. Review.** *Phase 3.* The ranked table, sortable and filterable, with safeguard
 badges. Checkboxes replace `approved.txt`. Bulk selection by predicate ("all
 scoring ≥ 8 with no safeguard"). Per-sender expander showing message dates and
 truncated subjects.
 
-**4. Confirm.** Exact per-sender counts. Safeguarded senders listed separately
+**4. Confirm.** *Phase 4.* Exact per-sender counts. Safeguarded senders listed separately
 and requiring individual override — never swept along by a bulk select.
 
-**5. Execute and undo.** Progress, then a persistent Undo backed by the
-manifest.
+**5. Execute and undo.** *Phase 4.* Progress, then a persistent Undo backed by
+the manifest.
 
 ---
 
@@ -228,14 +259,18 @@ that exists independently of the application's own state.
 | Phase | Scope | Notes |
 |---|---|---|
 | 1 | Rate limiter | **Shipped.** Independent of the UI; fixed the pain being felt and speeds all later testing |
-| 2 | Server, preflight, scan progress | No deletion path exists yet |
+| 2 | Server, preflight, scan progress | **Shipped.** No deletion path exists; the token, the bind and the escaping landed here |
 | 3 | Review table and selection | Replaces `approved.txt` |
-| 4 | Execute and undo | Token and escaping must land *before* this |
+| 4 | Execute and undo | Token and escaping already landed in phase 2, as required |
 | 5 | Incremental history scans | Makes ongoing use cheap |
 
 The rate limiter led deliberately. It was the problem actually being felt, it
 carried no UI risk, and every later phase is easier to test when a scan takes
 minutes instead of an hour.
+
+Phase 2 followed the same logic one level up: the security machinery a
+deletion endpoint needs is easier to get right, and much easier to test, on a
+surface that cannot delete anything if it is wrong.
 
 ---
 
@@ -285,17 +320,42 @@ simulated ceiling and clears the >20 msg/s bar at ceiling 35
 (`test_fleet_clears_the_twenty_messages_per_second_bar`). The real-mailbox
 measurement that fills the empty table row above has not been run yet.
 
-### Phase 2 — server, preflight, scan progress
+### Phase 2 — server, preflight, scan progress (shipped)
 
-**Touch:** new `cmd_ui()`; reuse `list_ids()`, `cmd_fetch()`, `load_cache()`.
+**Touched:** new `cmd_ui()`, `make_ui_server()`, `_UIHandler`, `ScanState`,
+`preflight()`, `classify_gws_error()`, `UI_HTML`. Nothing existing changed:
+the UI calls `cmd_fetch()` and `load_cache()` as they already were.
 
-`ThreadingHTTPServer` bound to `127.0.0.1` explicitly. Scan on a background
-thread. No mutating endpoint exists in this phase.
+`ThreadingHTTPServer` bound to `127.0.0.1` explicitly, on a background thread
+per request; the scan itself on one more. No mutating endpoint exists.
+
+The scan path is `cmd_fetch()` itself, not a reimplementation of it. That is
+what keeps the cache, the resumability, the drop accounting, the circuit
+breaker and the reconciliation identical between the two front ends, and
+`test_ui_scan_runs_the_very_same_fetch_path` asserts it against the same
+fixtures the CLI tests use. `_ui_run_scan()` exists only to catch the
+`sys.exit()` that `cmd_fetch` uses to report an abort — in a thread that is a
+silently swallowed `SystemExit`, and the message it carries is exactly what
+the page needs to show.
+
+Preflight is a real `getProfile` call with deliberately shallow retries: it
+answers a question, and a user staring at a blank panel should not wait out
+six backoffs to learn they are not logged in. `classify_gws_error()` is a pure
+function over the literal error strings indexed in `SETUP.md`, so the mapping
+is testable offline and a wording change in `gws` degrades to "here is the raw
+message" rather than to a confident wrong instruction.
 
 **Done when:** the browser shows live progress, the observed rate, and
 rate-limit state; preflight correctly distinguishes "not authenticated" from
 "authenticated but missing the Gmail scope" — the 403 case that `gws auth
-status` misreports.
+status` misreports. **Met**, against a stubbed transport and checked in a
+browser; the 18 tests named `test_ui_*` and `test_preflight_*` cover the
+guards, the classification and the scan path.
+
+**Not done in this phase, deliberately:** the page does not render a single
+mailbox-derived string yet — it shows counters and the user's own address.
+Phase 3 is where sender and `Subject` text first reaches a browser, which is
+why the escaping discipline had to be in place before it, not with it.
 
 ### Phase 3 — review and selection
 
@@ -333,6 +393,14 @@ permanent properties. Phase 1 has landed, so "5.1 msg/s sustained" is now
 marked historical in the table above. The post-limiter row stays empty until a
 real run fills it — an unmeasured projection sitting in that column would be
 exactly the thing this section exists to prevent.
+
+**It is still empty after phase 2.** Phase 1's own done-when has two halves,
+and only one of them is met: the offline simulation clears the 20 msg/s bar,
+but no run against a real mailbox has been measured. Phase 2 makes that
+measurement easy — the observed rate is now on screen while the scan runs, so
+filling the row is a matter of reading it off one real scan — but easy is not
+the same as done. Do not mark phase 1 fully complete, or fill that row, from
+the simulation.
 
 ## Risks and open questions
 

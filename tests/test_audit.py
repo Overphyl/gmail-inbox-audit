@@ -4,15 +4,19 @@
 These are offline: they exercise scoring, safeguards and the structural safety
 properties without touching the Gmail API.
 """
+import argparse
 import collections
 import contextlib
 import heapq
+import http.client
 import io
 import json
 import os
 import re
 import sys
 import tempfile
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -598,6 +602,369 @@ def test_consecutive_failures_trip_the_circuit_breaker():
             assert dropped < len(ids), "it should stop, not churn through all 60"
             return
     raise AssertionError("cmd_fetch should abort after consecutive failures")
+
+
+# ------------------------------------------------------------------- web ui
+# A localhost server that will one day trash mail is a materially different
+# risk profile from a CLI, so these are safety tests, not smoke tests. They
+# run a real server on a real loopback socket and speak real HTTP to it -
+# the guards live in header handling, which a direct call to the handler
+# would not exercise.
+SOURCE_TEXT = open(SOURCE, encoding="utf-8").read()
+# The UI section alone: main() below it legitimately references cmd_trash.
+UI_SECTION = SOURCE_TEXT.split(" web ui\n", 1)[1].split("def _add_rate_args", 1)[0]
+
+
+class _FakeProfile(object):
+    """Replaces g._run for getProfile alone."""
+
+    def __init__(self, profile=None, error=None):
+        self.profile = profile
+        self.error = error
+
+    def __call__(self, cmd):
+        if "getProfile" in cmd:
+            if self.error is not None:
+                return _Proc(1, "", self.error)
+            return _Proc(0, json.dumps(self.profile))
+        return _Proc(1, "", "unexpected argv: " + " ".join(cmd[:5]))
+
+
+@contextlib.contextmanager
+def _ui_server(args=None, token="test-token-value"):
+    """A real server on a real loopback port, torn down afterwards."""
+    ns = args or argparse.Namespace(sanitize=None, cache="headers.jsonl",
+                                    batch=1000, dropped="")
+    httpd = g.make_ui_server(port=0, token=token, args=ns)
+    t = threading.Thread(target=httpd.serve_forever)
+    t.daemon = True
+    t.start()
+    try:
+        yield httpd, httpd.server_address[1], token
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        t.join(timeout=5)
+
+
+def _ui_req(port, method="GET", path="/", token=None, origin=None, host=None,
+            body=None):
+    """One HTTP request. http.client, not urllib: Host and Origin have to be
+    forgeable, and a 403 has to come back as a response rather than an
+    exception."""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    headers = {}
+    if token is not None:
+        headers["X-Audit-Token"] = token
+    if origin is not None:
+        headers["Origin"] = origin
+    if host is not None:
+        headers["Host"] = host
+    payload = None
+    if body is not None:
+        payload = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    try:
+        conn.request(method, path, payload, headers)
+        r = conn.getresponse()
+        data = r.read().decode("utf-8", "replace")
+        return r.status, {k.lower(): v for k, v in r.getheaders()}, data
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------------ the bind
+def test_ui_binds_loopback_only():
+    """http.server binds 0.0.0.0 by default. Left alone that would put a
+    scan trigger - and, from phase 4, mail deletion - on every interface."""
+    with _ui_server() as (httpd, port, _):
+        assert httpd.server_address[0] == "127.0.0.1", httpd.server_address
+
+    for bad in ("0.0.0.0", "", "192.168.1.10", "::"):
+        try:
+            g._ui_bind_address(bad)
+        except ValueError:
+            continue
+        raise AssertionError("bound a non-loopback address: {!r}".format(bad))
+
+
+# ------------------------------------------------------------- the guards
+def test_ui_rejects_a_request_without_the_token():
+    with _ui_server() as (_, port, token):
+        for path in ("/", "/api/preflight", "/api/progress"):
+            code, _, _ = _ui_req(port, "GET", path)
+            assert code == 403, (path, code)
+            code, _, _ = _ui_req(port, "GET", path, token="wrong")
+            assert code == 403, (path, code)
+        code, _, _ = _ui_req(port, "POST", "/api/scan", body={})
+        assert code == 403, code
+        # ...and the real one still works, so the test is not passing for
+        # some unrelated reason.
+        code, _, _ = _ui_req(port, "GET", "/", token=token)
+        assert code == 200, code
+
+
+def test_ui_accepts_the_token_from_the_url_the_tool_opens():
+    with _ui_server() as (_, port, token):
+        code, _, body = _ui_req(port, "GET", "/?t=" + token)
+        assert code == 200, code
+        assert "gmail-audit" in body
+
+
+def test_ui_rejects_a_foreign_origin():
+    with _ui_server() as (_, port, token):
+        for origin in ("http://evil.example", "null",
+                       "http://127.0.0.1:1", "https://127.0.0.1:{}".format(port)):
+            code, _, _ = _ui_req(port, "POST", "/api/scan", token=token,
+                                 origin=origin, body={})
+            assert code == 403, (origin, code)
+        code, _, _ = _ui_req(port, "GET", "/api/progress", token=token,
+                             origin="http://127.0.0.1:{}".format(port))
+        assert code == 200, code
+
+
+def test_ui_rejects_a_foreign_host_header():
+    """DNS rebinding: the attacker's name resolves to 127.0.0.1, so the
+    connection is genuinely local and only the Host header gives it away."""
+    with _ui_server() as (_, port, token):
+        for host in ("evil.example:{}".format(port), "evil.example",
+                     "127.0.0.1", "127.0.0.1:{}".format(port + 1)):
+            code, _, _ = _ui_req(port, "GET", "/api/progress", token=token,
+                                 host=host)
+            assert code == 403, (host, code)
+        for host in ("127.0.0.1:{}".format(port), "localhost:{}".format(port)):
+            code, _, _ = _ui_req(port, "GET", "/api/progress", token=token,
+                                 host=host)
+            assert code == 200, (host, code)
+
+
+def test_ui_emits_no_cors_headers():
+    """Without one, a foreign page may fire a request but can never read the
+    answer. The OPTIONS preflight such a page sends is refused outright."""
+    with _ui_server() as (_, port, token):
+        responses = [
+            _ui_req(port, "GET", "/", token=token),
+            _ui_req(port, "GET", "/api/progress", token=token),
+            _ui_req(port, "GET", "/api/progress"),            # a 403
+            _ui_req(port, "OPTIONS", "/api/scan", token=token),
+        ]
+    for code, headers, _ in responses:
+        leaked = [k for k in headers if k.startswith("access-control-")]
+        assert not leaked, leaked
+    assert responses[-1][0] == 405, responses[-1][0]
+    assert "Access-Control" not in UI_SECTION, (
+        "not even in a comment: this test greps the section"
+    )
+
+
+def test_ui_sets_a_content_security_policy_with_no_outbound_channel():
+    """Defence in depth for phase 3, which renders sender-chosen text on
+    this page: an injected script would have nowhere to send anything."""
+    with _ui_server() as (_, port, token):
+        _, headers, _ = _ui_req(port, "GET", "/", token=token)
+    csp = headers.get("content-security-policy", "")
+    assert "default-src 'none'" in csp, csp
+    assert "connect-src 'self'" in csp, csp
+    assert headers.get("x-content-type-options") == "nosniff", headers
+
+
+# ------------------------------------------------- no mutation this phase
+def test_ui_exposes_no_mutating_route():
+    """Phase 2's boundary. DESIGN-UI.md puts the token and the escaping
+    before the deletion path, not alongside it; a phase 4 that adds a route
+    here is expected to update this test deliberately."""
+    for name in ("cmd_trash", "cmd_untrash", "_trash_one", "_untrash_one",
+                 "_safe_mutate"):
+        assert name not in UI_SECTION, name
+    with _ui_server() as (_, port, token):
+        for path in ("/api/trash", "/api/untrash", "/api/selection"):
+            code, _, _ = _ui_req(port, "POST", path, token=token, body={})
+            assert code == 404, (path, code)
+        for method in ("PUT", "DELETE"):
+            code, _, _ = _ui_req(port, method, "/api/scan", token=token)
+            assert code == 405, (method, code)
+
+
+def test_ui_page_never_writes_markup():
+    """The CLI printed Subject to a terminal; a browser executes it. Phase 3
+    renders sender-chosen text on a page holding a token, so textContent has
+    to be the only path in before then - not after."""
+    for banned in ("innerHTML", "outerHTML", "insertAdjacentHTML",
+                   "document.write", "eval(", "new Function"):
+        assert banned not in g.UI_HTML, banned
+    assert "textContent" in g.UI_HTML
+    # Nothing is loaded from anywhere: no CDN, no font, no analytics. That is
+    # what lets the CSP be 'none' for every fetch directive but this server.
+    assert "http://" not in g.UI_HTML and "https://" not in g.UI_HTML
+
+
+# ---------------------------------------------------------------- preflight
+def test_preflight_distinguishes_missing_scope_from_missing_auth():
+    """The trap this screen exists for. `gws auth status` reports REQUESTED
+    scopes, so an identity-only token looks healthy until a real call is
+    made - an hour into a scan that could never have worked. The strings are
+    the literal ones indexed in docs/SETUP.md."""
+    cases = {
+        "Access denied. No credentials provided.": "unauthenticated",
+        "invalid_grant: token expired": "unauthenticated",
+        "Request had insufficient authentication scopes.": "insufficient_scope",
+        "403 insufficientPermissions": "insufficient_scope",
+        "error: unrecognized subcommand": "no_gws",
+        "Invalid --params JSON: key must be a string at line 1 column 2":
+            "bad_params",
+        "something nobody has seen before": "error",
+    }
+    for text, want in cases.items():
+        got = g.classify_gws_error(text)
+        assert got == want, (text, got, want)
+
+
+def test_preflight_error_status_carries_a_hint_for_every_case():
+    for status, _ in g.UI_ERRORS:
+        assert g.UI_HINTS.get(status), status
+    assert g.UI_HINTS.get("error")
+
+
+def test_preflight_reports_the_profile_without_a_scan():
+    profile = {"emailAddress": "someone@example.com", "messagesTotal": 35012,
+               "threadsTotal": 21004, "historyId": "998877"}
+    orig_run, orig_limiter = g._run, g.LIMITER
+    try:
+        g._run, g.LIMITER = _FakeProfile(profile), None
+        args = argparse.Namespace(sanitize=None, cache="headers.jsonl",
+                                  batch=1000, dropped="")
+        with _ui_server(args) as (_, port, token):
+            code, _, body = _ui_req(port, "GET", "/api/preflight", token=token)
+        d = json.loads(body)
+    finally:
+        g._run, g.LIMITER = orig_run, orig_limiter
+    assert code == 200 and d["ok"] and d["status"] == "ok", d
+    assert d["email"] == "someone@example.com"
+    assert d["messages_total"] == 35012
+    # Stored for phase 5: an incremental rescan starts from this.
+    assert d["history_id"] == "998877"
+
+
+def test_preflight_surfaces_the_scope_failure_over_http():
+    orig_run, orig_limiter = g._run, g.LIMITER
+    try:
+        g._run = _FakeProfile(error="Request had insufficient authentication "
+                                    "scopes. [403]")
+        g.LIMITER = None
+        with _ui_server() as (_, port, token):
+            code, _, body = _ui_req(port, "GET", "/api/preflight", token=token)
+        d = json.loads(body)
+    finally:
+        g._run, g.LIMITER = orig_run, orig_limiter
+    assert code == 200, code
+    assert d["ok"] is False and d["status"] == "insufficient_scope", d
+    assert "auth status" in d["hint"], d["hint"]
+
+
+# ------------------------------------------------------------------- scan
+def _wait_for(predicate, timeout=20.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_ui_scan_runs_the_very_same_fetch_path():
+    """The UI is a front-end over cmd_fetch, not a second scan path: same
+    cache, same resumability, same drop accounting."""
+    ids = ["a1", "b2", "c3", "d4"]
+    orig_run, orig_limiter, orig_progress = g._run, g.LIMITER, g.PROGRESS
+    err = io.StringIO()
+    try:
+        g._run, g.LIMITER = _FakeTransport(ids), None
+        with tempfile.TemporaryDirectory() as d:
+            args = argparse.Namespace(
+                sanitize=None, cache=os.path.join(d, "headers.jsonl"),
+                batch=1000, dropped=os.path.join(d, "dropped.jsonl"),
+            )
+            with contextlib.redirect_stderr(err):
+                with _ui_server(args) as (httpd, port, token):
+                    code, _, _ = _ui_req(
+                        port, "POST", "/api/scan", token=token,
+                        body={"query": "in:inbox", "concurrency": 4, "limit": 0},
+                    )
+                    assert code == 202, code
+                    assert _wait_for(
+                        lambda: httpd.ui_scan.snapshot()["status"] != "running"
+                    ), httpd.ui_scan.snapshot()
+                    state = httpd.ui_scan.snapshot()
+            assert state["status"] == "done", state
+            cached = {m["id"] for m in g.load_cache(args.cache)}
+            assert cached == set(ids), cached
+            assert not os.path.exists(args.dropped), "clean run, no drop file"
+    finally:
+        g._run, g.LIMITER, g.PROGRESS = orig_run, orig_limiter, orig_progress
+
+
+def test_ui_progress_reports_the_rate_and_the_limiter_state():
+    """DESIGN-UI.md's phase 2 done-when: progress, observed rate, and
+    rate-limit state. A stall must read as 'backoff 12s', not as a frozen
+    counter."""
+    orig_limiter, orig_progress = g.LIMITER, g.PROGRESS
+    try:
+        g.LIMITER = g.RateLimiter(rate=9.0, burst=4, max_rate=40.0)
+        g.PROGRESS = g.FetchProgress(1000)
+        g.PROGRESS.record_done(250)
+        with _ui_server() as (httpd, port, token):
+            httpd.ui_scan.begin("in:inbox")
+            code, _, body = _ui_req(port, "GET", "/api/progress", token=token)
+        d = json.loads(body)
+    finally:
+        g.LIMITER, g.PROGRESS = orig_limiter, orig_progress
+    assert code == 200, code
+    assert d["scan"]["phase"] == "fetching", d["scan"]
+    assert d["progress"]["done"] == 250 and d["progress"]["total"] == 1000
+    for key in ("rate", "avg_rate", "eta", "dropped"):
+        assert key in d["progress"], key
+    assert abs(d["limiter"]["rate"] - 9.0) < 1e-9, d["limiter"]
+    assert d["limiter"]["state"] in ("ramping", "holding", "at-max", "pinned",
+                                     "FLOOR"), d["limiter"]
+
+
+def test_ui_progress_says_listing_before_any_counter_exists():
+    """list_ids() runs for minutes on a large mailbox with nothing to count.
+    'enumerating' and 'wedged' must not look the same."""
+    orig_progress = g.PROGRESS
+    try:
+        g.PROGRESS = None
+        with _ui_server() as (httpd, port, token):
+            code, _, body = _ui_req(port, "GET", "/api/progress", token=token)
+            assert json.loads(body)["scan"]["phase"] == "idle"
+            httpd.ui_scan.begin("in:inbox")
+            _, _, body = _ui_req(port, "GET", "/api/progress", token=token)
+        assert json.loads(body)["scan"]["phase"] == "listing", body
+    finally:
+        g.PROGRESS = orig_progress
+
+
+def test_ui_refuses_concurrency_above_the_drop_threshold():
+    """Refused, not clamped. Above 16 the API drops messages, which
+    undercounts senders and corrupts the ranking; silently lowering the
+    number would hide that the user asked for something wrong."""
+    assert g.UI_MAX_CONCURRENCY == 16
+    with _ui_server() as (httpd, port, token):
+        for bad in (17, 24, 64, 0, -1):
+            code, _, body = _ui_req(port, "POST", "/api/scan", token=token,
+                                    body={"concurrency": bad})
+            assert code == 400, (bad, code)
+            assert "concurrency" in json.loads(body)["error"]
+        assert httpd.ui_scan.snapshot()["status"] == "idle"
+
+
+def test_ui_refuses_a_second_concurrent_scan():
+    with _ui_server() as (httpd, port, token):
+        assert httpd.ui_scan.begin("in:inbox") is True
+        code, _, body = _ui_req(port, "POST", "/api/scan", token=token,
+                                body={"concurrency": 4})
+        assert code == 409, code
+        assert "already running" in json.loads(body)["error"]
 
 
 # --------------------------------------------------------------- headline
