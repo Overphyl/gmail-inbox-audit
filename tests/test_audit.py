@@ -146,6 +146,8 @@ def test_dry_run_writes_manifest_but_does_not_mutate():
         a = argparse.Namespace(
             senders=senders, cache=FIXTURE, manifest=manifest,
             batch=100, concurrency=1, execute=False, yes=False, sanitize=None,
+            # This test is about the manifest, not the engaged-list guard.
+            engaged="", allow_missing_engaged=True,
         )
         g.cmd_trash(a)
         assert os.path.exists(manifest), "manifest must exist before mutation"
@@ -777,7 +779,8 @@ def _dry_run_targets(d, review=None, senders=None):
     manifest = os.path.join(d, "m-{}.jsonl".format("r" if review else "s"))
     a = argparse.Namespace(
         sanitize=None, review=review, senders=senders or "approved.txt",
-        engaged="", cache=FIXTURE, manifest=manifest, batch=250,
+        engaged="", allow_missing_engaged=True,
+        cache=FIXTURE, manifest=manifest, batch=250,
         concurrency=2, execute=False, yes=True,
     )
     with contextlib.redirect_stdout(io.StringIO()):
@@ -873,6 +876,7 @@ def test_trash_recomputes_the_safeguard_rather_than_trusting_the_file():
         out = io.StringIO()
         a = argparse.Namespace(
             sanitize=None, review=p, senders="approved.txt", engaged="",
+            allow_missing_engaged=True,
             cache=FIXTURE, manifest=os.path.join(d, "m.jsonl"), batch=250,
             concurrency=2, execute=False, yes=True,
         )
@@ -1297,6 +1301,171 @@ def test_ui_refuses_a_second_concurrent_scan():
         assert "already running" in json.loads(body)["error"]
 
 
+# ------------------------------------------------- the engaged-list guard
+def _rank_args(d, **kw):
+    a = argparse.Namespace(
+        cache=FIXTURE, engaged=os.path.join(d, "engaged.txt"), json=False,
+        review=None, preselect_score=0, allow_missing_engaged=False,
+    )
+    for k, v in kw.items():
+        setattr(a, k, v)
+    return a
+
+
+def _run_rank(a):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        g.cmd_rank(a)
+    return out.getvalue(), err.getvalue()
+
+
+def test_rank_review_refuses_without_the_engaged_list():
+    """A warning is not enough where a trash list is born. cmd_engaged already
+    refuses to write an empty list for the same reason: a silently inert
+    safeguard is worse than a loud failure, because the output looks correct
+    either way."""
+    with tempfile.TemporaryDirectory() as d:
+        a = _rank_args(d, review=os.path.join(d, "review.txt"))
+        try:
+            _run_rank(a)
+        except SystemExit as e:
+            assert "INACTIVE" in str(e) and "engaged" in str(e), e
+            assert "--allow-missing-engaged" in str(e), e
+            assert not os.path.exists(a.review), "nothing should be written"
+            return
+    raise AssertionError("rank --review must refuse with no engaged list")
+
+
+def test_rank_table_still_only_warns():
+    """The table is informational. Only the review file becomes a trash list,
+    so only it refuses."""
+    with tempfile.TemporaryDirectory() as d:
+        out, err = _run_rank(_rank_args(d))
+    assert "INACTIVE" in err, err
+    assert "news@deals.example.com" in out, "the table still prints"
+
+
+def test_rank_review_proceeds_with_the_explicit_override():
+    with tempfile.TemporaryDirectory() as d:
+        a = _rank_args(d, review=os.path.join(d, "review.txt"),
+                       allow_missing_engaged=True)
+        _run_rank(a)
+        assert os.path.exists(a.review)
+
+
+def test_an_empty_engaged_file_is_an_answer_not_a_gap():
+    """A mailbox with no sent mail is a real state. Only a MISSING file means
+    the step was never run."""
+    with tempfile.TemporaryDirectory() as d:
+        a = _rank_args(d, review=os.path.join(d, "review.txt"))
+        open(a.engaged, "w").close()
+        _run_rank(a)
+        assert os.path.exists(a.review)
+
+
+def test_trash_refuses_without_the_engaged_list():
+    """Checked at the step that moves mail too, not only at rank time: a
+    review file can reach trash written on another machine, or from before
+    the list existed. Without it the SAFEGUARD OVERRIDE block under-reports -
+    it still sees protected domains and stars, so it prints a confident,
+    incomplete answer."""
+    with tempfile.TemporaryDirectory() as d:
+        review = os.path.join(d, "review.txt")
+        with open(review, "w", encoding="utf-8") as f:
+            f.write("t   news@deals.example.com\n")
+        a = argparse.Namespace(
+            sanitize=None, review=review, senders="approved.txt",
+            engaged=os.path.join(d, "engaged.txt"),
+            allow_missing_engaged=False, cache=FIXTURE,
+            manifest=os.path.join(d, "m.jsonl"), batch=250, concurrency=2,
+            execute=False, yes=True,
+        )
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                g.cmd_trash(a)
+        except SystemExit as e:
+            assert "INACTIVE" in str(e), e
+            assert not os.path.exists(a.manifest), "no manifest before the guard"
+            return
+    raise AssertionError("trash must refuse with no engaged list")
+
+
+# ------------------------------------------------------------------ doctor
+def _doctor(mode, engaged="/nonexistent"):
+    """Run cmd_doctor over a stubbed transport. Returns (stdout, exit_code)."""
+    profile = {"emailAddress": "someone@example.com", "messagesTotal": 35012,
+               "threadsTotal": 21004, "historyId": "998877"}
+    errors = {
+        "scope": "Request had insufficient authentication scopes. [403]",
+        "noauth": "Access denied. No credentials provided.",
+    }
+    orig_run, orig_gws, orig_lim = g._run, g.GWS, g.LIMITER
+    out, code = io.StringIO(), 0
+    try:
+        g._run = _FakeProfile(profile if mode == "ok" else None,
+                              errors.get(mode))
+        g.GWS = sys.executable      # a real path, so the gws row passes
+        g.LIMITER = None
+        try:
+            with contextlib.redirect_stdout(out):
+                g.cmd_doctor(argparse.Namespace(sanitize=None, engaged=engaged))
+        except SystemExit as e:
+            code = 1 if e.code else 0
+            if isinstance(e.code, str):
+                out.write(e.code)
+    finally:
+        g._run, g.GWS, g.LIMITER = orig_run, orig_gws, orig_lim
+    return out.getvalue(), code
+
+
+def test_doctor_reports_ready_and_names_the_next_command():
+    text, code = _doctor("ok")
+    assert code == 0, text
+    assert "Ready" in text and "35,012" in text
+    # engaged comes first for the reason require_engaged enforces
+    assert "gmail_audit.py engaged" in text, text
+
+
+def test_doctor_distinguishes_the_two_auth_failures():
+    """The whole point: learn which of them you have from a command that
+    costs nothing, not from a scan that dies twenty minutes in."""
+    scope, scope_code = _doctor("scope")
+    noauth, noauth_code = _doctor("noauth")
+    assert scope_code == 1 and noauth_code == 1
+    assert "no Gmail scope" in scope, scope
+    assert "not authenticated" in noauth, noauth
+    # the literal error text stays verbatim, because SETUP.md indexes by it
+    assert "insufficient authentication scopes" in scope, scope
+    # and the fix stays copy-pasteable rather than wrapped mid-URL
+    assert "auth/gmail.modify,openid," in noauth, noauth
+
+
+def test_doctor_exits_nonzero_when_gws_is_absent():
+    orig_gws = g.GWS
+    try:
+        g.GWS = "definitely-not-a-real-binary-xyz"
+        out, code = io.StringIO(), 0
+        try:
+            with contextlib.redirect_stdout(out):
+                g.cmd_doctor(argparse.Namespace(sanitize=None, engaged="x"))
+        except SystemExit as e:
+            code = 1 if e.code else 0
+    finally:
+        g.GWS = orig_gws
+    assert code == 1
+    assert "not on PATH" in out.getvalue(), out.getvalue()
+
+
+def test_preflight_labels_do_not_drift():
+    """One label table. The page carries a JS copy it cannot import, so the
+    two are asserted to cover the same statuses instead."""
+    statuses = {s for s, _ in g.UI_ERRORS} | {"ok", "error"}
+    assert set(g.PREFLIGHT_LABELS) == statuses, g.PREFLIGHT_LABELS
+    for status in statuses:
+        assert status + ":" in g.UI_HTML, "UI_HTML PF_LABEL is missing " + status
+
+
+
 # --------------------------------------------------------------- headline
 def test_fleet_settles_near_a_simulated_ceiling():
     for ceiling in (10, 20, 35):
@@ -1325,8 +1494,11 @@ if __name__ == "__main__":
         try:
             fn()
             print("  PASS  {}".format(name))
-        except Exception as e:
+        except (Exception, SystemExit) as e:
+            # SystemExit is a BaseException, so a bare `except Exception`
+            # lets an unexpected sys.exit() inside a test abort the whole run
+            # and report nothing. That should be one failure, not silence.
             failed += 1
-            print("  FAIL  {}: {}".format(name, e))
+            print("  FAIL  {}: {}".format(name, str(e).splitlines()[:1]))
     print("\n{}/{} passed".format(len(fns) - failed, len(fns)))
     sys.exit(1 if failed else 0)

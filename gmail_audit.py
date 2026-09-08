@@ -10,7 +10,9 @@ Subcommands:
   baseline  Message counts by year and by sender domain
   fetch     Pull headers oldest-first into a resumable JSONL cache
   engaged   Build the replied-to address list (false-positive safeguard)
-  rank      Score senders and emit the ranked index
+  rank      Score senders and emit the ranked index or a review file
+  doctor    Check auth, scope and prerequisites before a long run
+  status    Report on a scan running in another terminal
   trash     Trash messages from an explicitly approved sender list
   untrash   Restore from a manifest
   ui        Local web UI: preflight and live scan progress (read-only)
@@ -1151,6 +1153,35 @@ def load_engaged(path):
         return {l.strip().lower() for l in f if l.strip()}
 
 
+def require_engaged(path, allow_missing, action):
+    """Refuse to build or act on a trash list with the replied-to safeguard absent.
+
+    A warning is not enough at these two points. `cmd_engaged` already
+    refuses to write an empty list for exactly this reason: a silently inert
+    safeguard is more dangerous than a loud failure, because the output looks
+    correct either way. Without this list, `rank --review` marks people you
+    correspond with as trashable, and `cmd_trash`'s SAFEGUARD OVERRIDE block
+    under-reports - it can still see protected domains and stars, so it prints
+    a confident, incomplete answer.
+
+    A file that exists but is empty is a real answer: a mailbox with no sent
+    mail. Only a MISSING file refuses, because only that means the step was
+    never run.
+    """
+    if allow_missing or (path and os.path.exists(path)):
+        return
+    sys.exit(
+        "no engaged-sender list at {}, so the 'you have written to this "
+        "sender'\nsafeguard is INACTIVE. Refusing to {}.\n\n"
+        "Without it, senders you actually correspond with are "
+        "indistinguishable from\nstrangers: they get marked trashable, and "
+        "the safeguard-override block will\nnot list them.\n\n"
+        "    python gmail_audit.py engaged\n\n"
+        "It is read-only and takes a few minutes. If you genuinely have no "
+        "sent mail,\npass --allow-missing-engaged.".format(path, action)
+    )
+
+
 def sender_guard(sender, group, engaged):
     """The false-positive safeguard for one sender, or None.
 
@@ -1218,6 +1249,11 @@ def cmd_rank(a):
         sys.exit("no cached headers at {} - run 'fetch' first".format(a.cache))
 
     engaged = load_engaged(a.engaged)
+    # Before the warning below, not after: on the refusal path the warning is
+    # just noise in front of a longer message that says the same thing.
+    if getattr(a, "review", None):
+        require_engaged(a.engaged, getattr(a, "allow_missing_engaged", False),
+                        "write a review file")
     if not engaged:
         print(
             "WARNING: no engaged-sender list ({}). The 'you have corresponded\n"
@@ -1231,6 +1267,8 @@ def cmd_rank(a):
     rows = rank_rows(msgs, engaged)
 
     if getattr(a, "review", None):
+        # Guarded above: the table is informational and keeps the warning,
+        # but this file is what becomes a trash list.
         summary = write_review(a.review, rows,
                                preselect_score=getattr(a, "preselect_score", 0))
         _report_review(a.review, summary)
@@ -1515,6 +1553,13 @@ def cmd_trash(a):
     # Recomputed from the cache, never read off the review file: deleting the
     # [!] flag by hand removes the marker, not the warning. Safeguards still
     # do not override the human's list - they are surfaced, then obeyed.
+    #
+    # Checked here too, not only at rank time: this is the step that moves
+    # mail, and a review file can reach it having been written on another
+    # machine or before the list existed.
+    require_engaged(getattr(a, "engaged", ""),
+                    getattr(a, "allow_missing_engaged", False),
+                    "trash anything")
     engaged = load_engaged(getattr(a, "engaged", ""))
     groups = group_by_sender(msgs)
     overrides = {
@@ -1690,6 +1735,18 @@ UI_ERRORS = (
         r"\b403\b|PERMISSION_DENIED|forbidden", re.I)),
 )
 
+# The four preflight outcomes, named once. cmd_doctor renders these and so
+# does the page; test_preflight_labels_do_not_drift asserts the JS copy in
+# UI_HTML covers exactly the same set.
+PREFLIGHT_LABELS = {
+    "ok": "authenticated",
+    "unauthenticated": "not authenticated",
+    "insufficient_scope": "authenticated, but no Gmail scope",
+    "no_gws": "gws not found",
+    "bad_params": "the shell mangled the JSON argument",
+    "error": "check failed",
+}
+
 UI_HINTS = {
     "no_gws": "gws is not on PATH, or this shell predates the install. Open a "
               "new terminal; on Windows set GWS_BIN to the real .exe. "
@@ -1754,6 +1811,77 @@ def preflight(sanitize=None):
         "detail": "",
         "hint": "",
     }
+
+
+def _doctor_row(name, value, ok):
+    return "  {:<12}{:<44}{}".format(name, str(value)[:43], "ok" if ok else "FAIL")
+
+
+def cmd_doctor(a):
+    """Check the things that stop a first run, before an hour is spent.
+
+    Everything here is one API call or less. The point is that a newcomer
+    learns which of the four failures they have from a command that costs
+    nothing, rather than from a scan that dies twenty minutes in.
+    """
+    print("gmail-audit doctor\n")
+    rows, ok = [], True
+
+    version = ".".join(str(n) for n in sys.version_info[:3])
+    py_ok = sys.version_info >= (3, 8)
+    rows.append(_doctor_row("python", version, py_ok))
+    ok = ok and py_ok
+
+    # _find_gws() falls back to the bare name, which resolves to nothing if
+    # gws is not installed - so presence has to be checked, not assumed.
+    import shutil
+    gws_path = GWS if (os.path.isabs(GWS) and os.path.exists(GWS)) else shutil.which(GWS)
+    rows.append(_doctor_row("gws", gws_path or "not on PATH", bool(gws_path)))
+
+    detail = hint = ""
+    if gws_path:
+        pf = preflight(a.sanitize)
+        label = PREFLIGHT_LABELS.get(pf["status"], pf["status"])
+        rows.append(_doctor_row("auth", label, pf["ok"]))
+        if pf["ok"]:
+            rows.append(_doctor_row(
+                "mailbox",
+                "{:,} messages, {:,} threads".format(
+                    int(pf["messages_total"] or 0), int(pf["threads_total"] or 0)),
+                True))
+            rows.append(_doctor_row("account", pf["email"], True))
+        else:
+            detail, hint = pf["detail"], pf["hint"]
+        ok = ok and pf["ok"]
+    else:
+        ok = False
+        hint = UI_HINTS["no_gws"]
+
+    for row in rows:
+        print(row)
+    if detail:
+        # Verbatim and unwrapped: this is the literal string SETUP.md is
+        # indexed by, so it has to stay greppable and copy-pasteable.
+        print("\n  " + detail.replace("\n", "\n  "))
+    if hint:
+        import textwrap
+        # break_long_words/break_on_hyphens off: the unauthenticated hint is a
+        # command with a long scope URL in it, and the whole point is that it
+        # can be copied. Overflowing the width beats splitting the URL.
+        print("\n" + textwrap.fill(
+            hint, width=76, initial_indent="  ", subsequent_indent="  ",
+            break_long_words=False, break_on_hyphens=False))
+
+    if not ok:
+        sys.exit(
+            "\nNot ready. Fix the above, then re-run:\n"
+            "    python gmail_audit.py doctor\n"
+            "docs/SETUP.md indexes troubleshooting by the literal error text."
+        )
+    # The engagement scan comes first for a reason - see require_engaged.
+    nxt = ("engaged" if not os.path.exists(a.engaged)
+           else "fetch --query in:inbox")
+    print("\nReady. Next:\n    python gmail_audit.py {}".format(nxt))
 
 
 class ScanState:
@@ -2519,6 +2647,11 @@ def main():
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    d = sub.add_parser("doctor", help="check auth and prerequisites before a run")
+    d.add_argument("--engaged", default="engaged.txt",
+                   help="checked only to suggest the next command")
+    d.set_defaults(func=cmd_doctor)
+
     b = sub.add_parser("baseline", help="counts by year")
     b.add_argument("--since", type=int, default=2015)
     b.set_defaults(func=cmd_baseline)
@@ -2552,6 +2685,9 @@ def main():
                    help="write a reviewable file (default %(const)s) instead "
                         "of the table; marks already in it are carried "
                         "forward")
+    r.add_argument("--allow-missing-engaged", action="store_true",
+                   help="write a review file with the replied-to safeguard "
+                        "INACTIVE. Only for a mailbox with no sent mail")
     r.add_argument("--preselect-score", type=int, default=0, metavar="N",
                    help="pre-mark unguarded senders scoring >= N. Safeguarded "
                         "senders are never marked. Off by default, because "
@@ -2574,6 +2710,9 @@ def main():
     t.add_argument("--engaged", default="engaged.txt",
                    help="replied-to list, used to flag safeguard overrides "
                         "(default %(default)s)")
+    t.add_argument("--allow-missing-engaged", action="store_true",
+                   help="trash with the replied-to safeguard INACTIVE. Only "
+                        "for a mailbox with no sent mail")
     t.add_argument("--cache", default="headers.jsonl")
     t.add_argument("--manifest", default="trashed-manifest.jsonl",
                    help="written before any mutation; used by 'untrash'")
