@@ -97,7 +97,7 @@ Then get the tool:
 ```bash
 git clone https://github.com/Overphyl/gmail-inbox-audit.git
 cd gmail-inbox-audit
-python tests/test_audit.py      # optional: 67 offline tests, no API access
+python tests/test_audit.py      # optional: 76 offline tests, no API access
 ```
 
 ## Setup
@@ -140,6 +140,29 @@ gws gmail users getProfile --params '{"userId":"me"}'
 
 ## Usage
 
+### 0. Check you are ready
+
+```bash
+python gmail_audit.py doctor
+```
+
+```
+gmail-audit doctor
+
+  python      3.12.4                                      ok
+  gws         /usr/local/bin/gws                          ok
+  auth        authenticated                               ok
+  mailbox     35,012 messages, 21,004 threads             ok
+
+Ready. Next:
+    python gmail_audit.py engaged
+```
+
+One API call. It tells you which of the four setup failures you have, with
+the `SETUP.md` section that fixes it — including the one `gws auth status`
+misreports, where you are authenticated but the token carries no Gmail scope.
+Worth thirty seconds before an hour-long scan.
+
 The CLI below is the reference path. `python gmail_audit.py ui` puts steps 1
 and 3 in a browser instead — an auth preflight that catches the scope trap
 before you wait an hour for a scan that cannot work, and live scan progress
@@ -163,8 +186,11 @@ Scans `in:sent` for everyone you have written to. Senders on this list are
 never recommended for Trash.
 
 > Run this **before** ranking. Without it the safeguard is inactive and people
-> you actively correspond with can be scored as Trash. `rank` warns loudly if
-> the list is missing, and `engaged` refuses to write an empty list.
+> you actively correspond with can be scored as Trash. This is enforced, not
+> just warned about: `rank --review` and `trash` both **refuse** to run when
+> `engaged.txt` is missing, and `engaged` refuses to write an empty list. If
+> you genuinely have no sent mail, `--allow-missing-engaged` says so
+> explicitly.
 
 ### 3. Fetch headers
 

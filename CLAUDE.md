@@ -10,7 +10,7 @@ spam signals, and bulk-trashes senders the user has explicitly approved. Python
 to the `gws` CLI for Gmail API access.
 
 Everything lives in one module, `gmail_audit.py`, with subcommands: `baseline`,
-`fetch`, `engaged`, `rank`, `status`, `trash`, `untrash`, `ui`. The `ui`
+`doctor`, `fetch`, `engaged`, `rank`, `status`, `trash`, `untrash`, `ui`. The `ui`
 subcommand serves a localhost page with an auth preflight and live scan
 progress; it is phase 2 of `docs/DESIGN-UI.md` and has no mutating endpoint.
 `status` reports on a scan running in another terminal by reading the file the
@@ -40,6 +40,17 @@ escaped as text, never markup.
 **Headers only, never bodies.** All reads use `format=metadata` with an
 explicit `metadataHeaders` allowlist, under which the Gmail API returns no body
 payload at all. Do not add `format=full` or `format=raw`.
+
+**The replied-to safeguard is required, not advisory.** `rank --review` and
+`cmd_trash` both call `require_engaged()` and *exit* when `engaged.txt` is
+missing. A warning was not enough: without that list the output looks correct
+either way, senders you correspond with get marked trashable, and the
+SAFEGUARD OVERRIDE block prints a confident, incomplete answer because it can
+still see protected domains and stars. An existing but *empty* file is a real
+answer (a mailbox with no sent mail) and passes; only a missing file refuses.
+`--allow-missing-engaged` is the explicit override. The plain `rank` table
+keeps the old warning, because it is informational and does not become a
+trash list.
 
 **Approval is a list, not a threshold.** `cmd_trash` refuses to run without an
 explicit file of approved sender addresses. It must never act on "everything
@@ -120,7 +131,7 @@ docs/SETUP.md             OAuth setup, troubleshooting, platform notes
 docs/DESIGN-UI.md         proposed web UI (not implemented; Phase 1 shipped)
 docs/PLAN-RATE-LIMITER.md how the shared rate limiter works, and why
 docs/images/*.svg         hand-authored setup diagrams
-tests/test_audit.py       67 offline tests, no API access needed
+tests/test_audit.py       76 offline tests, no API access needed
 tests/fixtures/           synthetic headers, example.com domains only
 tests/check_diagrams.py   geometric checks on the SVGs
 ```
@@ -144,7 +155,9 @@ tests/check_diagrams.py   geometric checks on the SVGs
 | The review file, both directions | `write_review()`, `parse_review()`, `load_review_approved()` |
 | Cross-process scan status | `StatusWriter`, `read_status()`, `cmd_status()` |
 | Mutation | `_trash_one()`, `cmd_trash()`, `cmd_untrash()` |
-| Auth preflight and its error classification | `preflight()`, `classify_gws_error()`, `UI_ERRORS`, `UI_HINTS` |
+| Auth preflight and its error classification | `preflight()`, `classify_gws_error()`, `UI_ERRORS`, `UI_HINTS`, `PREFLIGHT_LABELS` |
+| First-run readiness check | `cmd_doctor()` |
+| The required replied-to safeguard | `require_engaged()`, `load_engaged()` |
 | UI server, bind guard, request guards, routing | `make_ui_server()`, `_ui_bind_address()`, `_UIHandler` |
 | Scan lifecycle behind the UI | `ScanState`, `_ui_run_scan()`, `cmd_ui()` |
 | The served page (inlined CSS and JS) | `UI_HTML` |
