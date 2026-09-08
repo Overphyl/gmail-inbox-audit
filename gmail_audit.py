@@ -2808,16 +2808,23 @@ def _add_rate_args(sub, dropped_default=None, status_default=None):
     # fixed rate on a real mailbox, so it is opt-in until it is fixed rather
     # than the thing every first run gets. --rate 0 still means "adapt", which
     # is what it has always meant.
-    pacing = sub.add_mutually_exclusive_group()
-    pacing.add_argument("--rate", type=float, default=RATE_DEFAULT,
-                        help="pin a fixed req/s (default %(default)s). "
-                             "Throttles still pause but never shrink a pinned "
-                             "rate. 0 means adapt")
-    pacing.add_argument("--adaptive", action="store_true",
-                        help="search for the rate instead of pinning it. "
-                             "KNOWN BROKEN on a per-minute quota: it collapses "
-                             "to the floor and is slower. See "
-                             "docs/PLAN-RATE-LIMITER.md")
+    #
+    # Not an argparse mutually_exclusive_group, deliberately. That rejected the
+    # pair with "argument --adaptive: not allowed with argument --rate", which
+    # says what is refused and not what to type instead - and since --rate now
+    # carries a default, "pin at 8 and also adapt" is a reasonable thing to
+    # have believed you were asking for. _make_limiter refuses it with the
+    # answer attached. Hence default=None: it is the only way to tell "--rate 8"
+    # from the default, and the conflict is exactly about what was TYPED.
+    sub.add_argument("--rate", type=float, default=None,
+                     help="pin a fixed req/s (default {}). Throttles still "
+                          "pause but never shrink a pinned rate. 0 means "
+                          "adapt".format(RATE_DEFAULT))
+    sub.add_argument("--adaptive", action="store_true",
+                     help="search for the rate instead of pinning it. "
+                          "KNOWN BROKEN on a per-minute quota: it collapses "
+                          "to the floor and is slower. See "
+                          "docs/PLAN-RATE-LIMITER.md")
     sub.add_argument("--max-rate", type=float, default=RATE_MAX,
                      help="ceiling on the --adaptive search (default %(default)s)")
     sub.add_argument("--start-rate", type=float, default=RATE_START,
@@ -2840,10 +2847,33 @@ def _make_limiter(a):
     if not hasattr(a, "max_rate") or getattr(a, "no_rate_limit", False):
         return None
     # getattr, not attribute access: the UI and several tests build a namespace
-    # by hand and predate this flag.
-    pinned = a.rate and a.rate > 0 and not getattr(a, "adaptive", False)
+    # by hand and predate these flags.
+    rate = getattr(a, "rate", None)
+    adaptive = getattr(a, "adaptive", False)
+    if rate is not None and adaptive:
+        # Columns computed, not hand-padded: the option strings carry the rate
+        # the user typed, so their width is not known here.
+        choices = [
+            ("--rate {:g}".format(rate), "pin it there"),
+            ("--adaptive --start-rate {:g}".format(rate),
+             "begin the search there"),
+            ("(nothing)",
+             "pin at {:g}, the measured default".format(RATE_DEFAULT)),
+        ]
+        w = max(len(opt) for opt, _ in choices) + 4
+        sys.exit(
+            "--rate and --adaptive are mutually exclusive: one pins the rate, "
+            "the other\nsearches for it.\n\n{}\n\n"
+            "The search is the broken half - see docs/PLAN-RATE-LIMITER.md - "
+            "so unless you\nare investigating it, drop --adaptive.".format(
+                "\n".join("  {:<{w}}{}".format(o, t, w=w)
+                          for o, t in choices)))
+    if rate is None:
+        # An --adaptive run wants the search, which is what rate 0 selects.
+        rate = 0.0 if adaptive else RATE_DEFAULT
+    pinned = rate > 0
     return RateLimiter(
-        rate=(a.rate if pinned else a.start_rate),
+        rate=(rate if pinned else a.start_rate),
         burst=RATE_BURST,
         min_rate=RATE_MIN,
         max_rate=a.max_rate,

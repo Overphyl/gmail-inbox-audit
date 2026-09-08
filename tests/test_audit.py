@@ -462,7 +462,7 @@ def test_a_scan_pins_its_rate_by_default():
     at 8 held 5.17. Until that is fixed, the broken half is opt-in rather than
     the thing every first run gets."""
     a = _parse_fetch([])
-    assert a.rate == g.RATE_DEFAULT and a.adaptive is False, a
+    assert a.rate is None and a.adaptive is False, a
     lim = g._make_limiter(a)
     assert lim.rate == g.RATE_DEFAULT, lim.rate
     assert lim.adaptive is False, "the default must not search for a rate"
@@ -478,10 +478,15 @@ def test_adaptive_is_still_reachable_two_ways():
 
 def test_rate_and_adaptive_cannot_both_be_asked_for():
     """Silently letting one win is how a run ends up paced by something the
-    operator did not choose."""
+    operator did not choose. The refusal must also say what to type instead:
+    since --rate carries a default, "pin at 8 and also adapt" is a reasonable
+    thing to have believed you were asking for, and --start-rate is not a name
+    anyone guesses."""
     try:
-        _parse_fetch(["--rate", "12", "--adaptive"])
-    except SystemExit:
+        g._make_limiter(_parse_fetch(["--rate", "12", "--adaptive"]))
+    except SystemExit as e:
+        assert "--start-rate 12" in str(e), e
+        assert "--rate 12" in str(e), e
         return
     raise AssertionError("--rate and --adaptive must be mutually exclusive")
 
