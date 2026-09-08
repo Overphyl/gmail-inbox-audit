@@ -608,7 +608,11 @@ def _gitignored(name):
 def test_status_file_carries_a_scan_across_processes():
     """The scan dies with its shell. Without this file, "how far along is the
     run in that other window?" has no answer at all."""
-    ids = ["a1", "b2", "c3", "d4"]
+    # Uppercase deliberately. The blob includes the cache and status PATHS,
+    # and tempfile builds its directory name from [a-z0-9_] - so a 2-char
+    # lowercase id like "d4" lands inside a random temp path about 2% of the
+    # time and fails this assertion for no reason. Uppercase cannot collide.
+    ids = ["MSGA", "MSGB", "MSGC", "MSGD"]
     with tempfile.TemporaryDirectory() as d:
         a = _fetch_args(d, ids, status=os.path.join(d, "fetch-status.json"))
         _run_fetch(a, _FakeTransport(ids))
@@ -1299,6 +1303,146 @@ def test_ui_refuses_a_second_concurrent_scan():
                                 body={"concurrency": 4})
         assert code == 409, code
         assert "already running" in json.loads(body)["error"]
+
+
+# -------------------------------------------------- engaged resumability
+class _FakeSent(object):
+    """A sent-mail transport. Each message has one distinct recipient, so the
+    union of addresses says exactly which messages were scanned."""
+
+    def __init__(self, ids, fail=()):
+        self.ids = list(ids)
+        self.fail = set(fail)
+        self.requested = []
+
+    def __call__(self, cmd):
+        argv = list(cmd)
+        if "list" in argv:
+            return _Proc(0, json.dumps(
+                {"messages": [{"id": i} for i in self.ids]}) + "\n")
+        if "get" in argv:
+            params = json.loads(argv[argv.index("--params") + 1])
+            mid = params["id"]
+            self.requested.append(mid)
+            if mid in self.fail:
+                return _Proc(1, "", "requested entity was not found")
+            return _Proc(0, json.dumps({
+                "id": mid,
+                "internalDate": "1700000000000",
+                "labelIds": ["SENT"],
+                "payload": {"headers": [
+                    {"name": "To", "value": "{}@example.com".format(mid)},
+                ]},
+            }))
+        return _Proc(1, "", "unexpected argv")
+
+
+def _engaged_args(d, **kw):
+    a = argparse.Namespace(
+        sanitize=None, out=os.path.join(d, "engaged.txt"),
+        cache=os.path.join(d, "engaged-cache.jsonl"),
+        concurrency=4, limit=0,
+        dropped=os.path.join(d, "engaged-dropped.jsonl"), status="",
+    )
+    for k, v in kw.items():
+        setattr(a, k, v)
+    return a
+
+
+def _run_engaged(a, transport):
+    orig_run, orig_limiter = g._run, g.LIMITER
+    err = io.StringIO()
+    try:
+        g._run, g.LIMITER = transport, None
+        with contextlib.redirect_stderr(err):
+            g.cmd_engaged(a)
+    finally:
+        g._run, g.LIMITER = orig_run, orig_limiter
+    return err.getvalue()
+
+
+def test_engaged_checkpoints_every_message_it_scans():
+    ids = ["m{}".format(i) for i in range(6)]
+    with tempfile.TemporaryDirectory() as d:
+        a = _engaged_args(d)
+        _run_engaged(a, _FakeSent(ids))
+        rows = [json.loads(l) for l in open(a.cache, encoding="utf-8")
+                if l.strip()]
+    assert {r["id"] for r in rows} == set(ids)
+    # Only the id and the extracted addresses - no headers, no subject.
+    assert all(set(r) == {"id", "addrs"} for r in rows), rows[0]
+
+
+def test_engaged_rerun_only_fetches_what_is_missing():
+    """The whole point: a scan that dies at minute 18 of 20 should cost
+    minutes to finish, not start over. Two real runs were lost before this."""
+    ids = ["m{}".format(i) for i in range(10)]
+    missing = {"m3", "m7"}
+    with tempfile.TemporaryDirectory() as d:
+        a = _engaged_args(d)
+        # First pass drops two. A dropped ID is never checkpointed.
+        first = _FakeSent(ids, fail=missing)
+        _run_engaged(a, first)
+        assert len(first.requested) >= len(ids)
+
+        # Second pass, clean transport: only the two gaps are re-requested.
+        second = _FakeSent(ids)
+        _run_engaged(a, second)
+        assert set(second.requested) == missing, second.requested
+
+        addrs = {l.strip() for l in open(a.out, encoding="utf-8") if l.strip()}
+    assert addrs == {"{}@example.com".format(i) for i in ids}, addrs
+
+
+def test_engaged_writes_no_partial_safeguard_list_when_it_aborts():
+    """require_engaged() only checks that engaged.txt EXISTS, so a partial
+    list would pass the guard while covering a fraction of the people you
+    write to. The checkpoint survives an aborted run; the artifact does not."""
+    ids = ["m{}".format(i) for i in range(60)]
+    with tempfile.TemporaryDirectory() as d:
+        a = _engaged_args(d)
+        transport = _FakeSent(ids, fail=set(ids))
+        transport.__class__.__call__.__doc__ = None
+        try:
+            _run_engaged(a, _FakeSentAuthExpired(ids))
+        except SystemExit as e:
+            assert "gws auth login" in str(e), e
+            assert not os.path.exists(a.out), "no partial engaged.txt"
+            return
+    raise AssertionError("an aborted engaged scan must not write the list")
+
+
+class _FakeSentAuthExpired(_FakeSent):
+    """Every get fails the way an expired refresh token does - which matches
+    neither retry regex, so the circuit breaker trips."""
+
+    def __call__(self, cmd):
+        if "get" in list(cmd):
+            return _Proc(1, "", "invalid_grant: token expired")
+        return _FakeSent.__call__(self, cmd)
+
+
+def test_engaged_cache_is_jsonl_and_gitignored():
+    assert g.ENGAGED_CACHE.endswith(".jsonl"), g.ENGAGED_CACHE
+    assert _gitignored(g.ENGAGED_CACHE), g.ENGAGED_CACHE
+
+
+def test_load_engaged_cache_unions_addresses_across_records():
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "c.jsonl")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"id": "a", "addrs": ["x@example.com"]}) + "\n")
+            f.write(json.dumps({"id": "b", "addrs": []}) + "\n")
+            f.write("not json\n")
+            f.write(json.dumps({"id": "c", "addrs": ["x@example.com",
+                                                     "y@example.com"]}) + "\n")
+        ids, addrs = g.load_engaged_cache(p)
+    # A message with no recipients still counts as scanned, or it would be
+    # re-fetched forever.
+    assert ids == {"a", "b", "c"}
+    assert addrs == {"x@example.com", "y@example.com"}
+    assert g.load_engaged_cache(os.path.join(d, "nope.jsonl")) == (set(), set())
+
 
 
 # ------------------------------------------------- the engaged-list guard

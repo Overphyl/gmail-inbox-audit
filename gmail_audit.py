@@ -501,6 +501,10 @@ LATENCY = 0.35  # observed mean messages.get round trip, seconds
 # silently make it committable.
 FETCH_DROPPED = "fetch-dropped.jsonl"
 ENGAGED_DROPPED = "engaged-dropped.jsonl"
+# The engaged scan's resume checkpoint. .jsonl for the same reason the
+# drop files are: it holds real recipient addresses and .gitignore carries
+# a bare *.jsonl rule.
+ENGAGED_CACHE = "engaged-cache.jsonl"
 
 
 class FetchProgress:
@@ -1022,41 +1026,101 @@ def cmd_fetch(a):
 
 
 # ----------------------------------------------------------------- engaged
+def load_engaged_cache(path):
+    """Return (scanned_ids, addrs) from a partial engaged scan.
+
+    Same shape and same reason as the fetch cache: a 20-minute scan that dies
+    at minute 18 should cost minutes to finish, not start over. Two real runs
+    were lost to this before it existed.
+
+    Only the message ID and the addresses extracted from it are stored, never
+    the headers - it is the smallest thing that makes a re-run cheap. It still
+    holds real recipient addresses, so it is .jsonl and gitignored like the
+    rest of the mailbox data.
+    """
+    ids, addrs = set(), set()
+    for rec in load_cache(path):
+        mid = rec.get("id")
+        if not mid:
+            continue
+        ids.add(mid)
+        for addr in rec.get("addrs") or []:
+            addrs.add(addr)
+    return ids, addrs
+
+
 def cmd_engaged(a):
     """Addresses the user has actually written to. These are never auto-Trashed."""
     ids = list_ids("in:sent", a.sanitize)
     if a.limit:
         ids = ids[: a.limit]
-    print("scanning {} sent messages".format(len(ids)), file=sys.stderr)
+
+    cache_path = getattr(a, "cache", "") or None
+    cached_ids, addrs = load_engaged_cache(cache_path)
+    todo = [i for i in ids if i not in cached_ids]
+    print(
+        "{} sent messages, {} already scanned, {} to scan".format(
+            len(ids), len(ids) - len(todo), len(todo)
+        ),
+        file=sys.stderr,
+    )
     print(_pacing_note(a), file=sys.stderr)
-    addrs = set()
-    seen = 0
+
+    seen = len(cached_ids)
     # Drops matter here too: a silently missing sent message weakens the
     # replied-to safeguard, and the empty-list guard below catches only total
-    # failure, not partial.
-    progress = FetchProgress(len(ids), drop_path=getattr(a, "dropped", "") or None)
+    # failure, not partial. A dropped ID is never checkpointed, so re-running
+    # retries it.
+    progress = FetchProgress(len(todo), drop_path=getattr(a, "dropped", "") or None)
     a.progress = progress
     status = StatusWriter(getattr(a, "status", "") or None, "engaged",
-                          query="in:sent", cache=a.out)
+                          query="in:sent", cache=cache_path or a.out)
     stop, reporter = _with_reporter(progress, status)
     interrupted = False
+    out = open(cache_path, "a", encoding="utf-8") if cache_path else None
     try:
-        for rec in _scan(ids, a, progress, ENGAGED_HEADERS):
+        for rec in _scan(todo, a, progress, ENGAGED_HEADERS):
             if not rec:
                 continue
             seen += 1
+            found = set()
             for field in ("to", "cc", "bcc"):
                 for m in ADDR.finditer(rec["headers"].get(field, "")):
-                    addrs.add(m.group(0).lower())
+                    found.add(m.group(0).lower())
+            addrs |= found
+            if out is not None:
+                out.write(
+                    json.dumps({"id": rec["id"], "addrs": sorted(found)},
+                               ensure_ascii=False) + "\n"
+                )
+                # Per record, like the drop file: an interrupted run is
+                # exactly when this file matters, and the write is trivial
+                # next to the network call that produced it.
+                out.flush()
     except KeyboardInterrupt:
         interrupted = True
-        raise
     finally:
         stop.set()
         reporter.join(timeout=5.0)
         progress.close()
+        if out is not None:
+            out.close()
         status.write(progress, LIMITER, _final_state(progress, interrupted))
-    _report_drops(progress, len(ids), "engaged")
+    _report_drops(progress, len(todo), "engaged")
+
+    # Neither an interrupted nor an aborted run writes engaged.txt, and that
+    # is deliberate. require_engaged() only checks that the file EXISTS, so a
+    # partial safeguard list is indistinguishable from a complete one - it
+    # would pass the guard while quietly covering a fraction of the people you
+    # write to. The checkpoint is what survives; the artifact is not.
+    if interrupted:
+        sys.exit(
+            "\ninterrupted - {:,} of {:,} sent messages scanned and saved to "
+            "{}.\nRe-run to resume; only the remainder is fetched.\n"
+            "{} was NOT written: a partial safeguard list would look exactly "
+            "like a\ncomplete one to every later step.".format(
+                progress.done, len(todo), cache_path or "(no cache)", a.out)
+        )
     _report_abort(progress)
 
     # A silent zero here means the safeguard is inert, which is far more
@@ -2672,6 +2736,9 @@ def main():
 
     e = sub.add_parser("engaged", help="build replied-to address list")
     e.add_argument("--out", default="engaged.txt")
+    e.add_argument("--cache", default=ENGAGED_CACHE,
+                   help="resume checkpoint (default %(default)s); a killed "
+                        "scan resumes from here. Empty string disables it")
     e.add_argument("--concurrency", type=int, default=8)
     e.add_argument("--limit", type=int, default=0)
     _add_rate_args(e, ENGAGED_DROPPED, ENGAGED_STATUS)

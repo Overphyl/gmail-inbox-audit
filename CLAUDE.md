@@ -52,6 +52,14 @@ answer (a mailbox with no sent mail) and passes; only a missing file refuses.
 keeps the old warning, because it is informational and does not become a
 trash list.
 
+**An interrupted or aborted `engaged` scan writes no `engaged.txt`.**
+`require_engaged()` only checks that the file *exists*, so a partial safeguard
+list is indistinguishable from a complete one: it would pass the guard while
+covering a fraction of the people you write to. The checkpoint
+(`engaged-cache.jsonl`, one record per scanned message) is what survives an
+interruption; the artifact is written only when the scan completes. Do not
+"helpfully" write what was collected so far.
+
 **Approval is a list, not a threshold.** `cmd_trash` refuses to run without an
 explicit file of approved sender addresses. It must never act on "everything
 scoring above N".
@@ -131,7 +139,7 @@ docs/SETUP.md             OAuth setup, troubleshooting, platform notes
 docs/DESIGN-UI.md         proposed web UI (not implemented; Phase 1 shipped)
 docs/PLAN-RATE-LIMITER.md how the shared rate limiter works, and why
 docs/images/*.svg         hand-authored setup diagrams
-tests/test_audit.py       76 offline tests, no API access needed
+tests/test_audit.py       81 offline tests, no API access needed
 tests/fixtures/           synthetic headers, example.com domains only
 tests/check_diagrams.py   geometric checks on the SVGs
 ```
@@ -158,6 +166,7 @@ tests/check_diagrams.py   geometric checks on the SVGs
 | Auth preflight and its error classification | `preflight()`, `classify_gws_error()`, `UI_ERRORS`, `UI_HINTS`, `PREFLIGHT_LABELS` |
 | First-run readiness check | `cmd_doctor()` |
 | The required replied-to safeguard | `require_engaged()`, `load_engaged()` |
+| Engaged scan resume checkpoint | `load_engaged_cache()`, `ENGAGED_CACHE` |
 | UI server, bind guard, request guards, routing | `make_ui_server()`, `_ui_bind_address()`, `_UIHandler` |
 | Scan lifecycle behind the UI | `ScanState`, `_ui_run_scan()`, `cmd_ui()` |
 | The served page (inlined CSS and JS) | `UI_HTML` |
