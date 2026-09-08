@@ -231,11 +231,27 @@ non-ASCII and Windows' cp1252 default raises `UnicodeDecodeError` mid-fetch.
 
 **Gmail quota is per MINUTE, not per second.** `messages.get` costs 5 units.
 
-*The backoff pathology is fixed.* Sustained scans used to collapse to ~5 msg/s
-because per-request exponential backoff idled each worker independently: twelve
-workers each discovered the ceiling alone and each slept up to 60s without
-telling the others. `RateLimiter` replaced that with one shared, adaptive pacer.
-Do not reintroduce a per-worker `delay` local in `gws()`.
+*The backoff pathology is fixed; the replacement has its own.* Sustained scans
+used to collapse to ~5 msg/s because per-request exponential backoff idled each
+worker independently: twelve workers each discovered the ceiling alone and each
+slept up to 60s without telling the others. `RateLimiter` replaced that with one
+shared pacer. Do not reintroduce a per-worker `delay` local in `gws()`.
+
+**But the ADAPTIVE half is broken, measured against a real mailbox on
+2026-09-08.** `THROTTLE_COALESCE` (2s) is shorter than `THROTTLE_HOLD` (15s), so
+whenever throttles arrive more often than every 15 seconds the increase branch
+is unreachable and the rate collapses to `RATE_MIN`. It did, on every adaptive
+run. Pinning with `--rate 8` was 32% faster and stable.
+
+The cause is that the real constraint is **`Units per minute per user`** — read
+off a real 429 — so cutting the rate cannot refund units already spent in the
+current minute. A 72% rate cut *raised* throttle frequency by 7%. AIMD on
+instantaneous rate is the wrong controller for a per-minute budget.
+`docs/PLAN-RATE-LIMITER.md`, "Measured against a real mailbox", has the numbers
+and the mechanism. **Until that is fixed, `--rate` is the fast path, not the
+escape hatch.** Do not trust `test_fleet_clears_the_twenty_messages_per_second_bar`:
+`_simulate()` models a trailing one-second window, under which AIMD converges
+by construction.
 
 *The concurrency limit is not fixed and is a different problem.* Concurrency
 above ~16 still causes the API to drop messages outright, which silently

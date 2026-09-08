@@ -54,15 +54,26 @@ behaviour that the shared limiter replaced, not current behaviour:
 | Short burst, concurrency 16 | 35.7 msg/s | historical |
 | Short burst, concurrency 12 | ~26 msg/s (projected) | historical |
 | **Sustained over 53 minutes, concurrency 12** | **5.1 msg/s** | **historical** |
-| Sustained, post-limiter, concurrency 12 | *not yet measured* | — |
+| Sustained, adaptive limiter, concurrency 12 | **3.7 msg/s** | measured 2026-09-08 |
+| Sustained, adaptive limiter, concurrency 4 | **3.9 msg/s** | measured 2026-09-08 |
+| **Sustained, limiter pinned `--rate 8`, concurrency 4** | **5.2 msg/s** | measured 2026-09-08 |
 
 The burst benchmark measured a fresh quota bucket. Sustained, the per-minute
 limit bound continuously and per-request exponential backoff — which climbs to
 60 seconds — idled every worker independently. The tool spent most of its wall
 clock asleep rather than near the quota ceiling.
 
-The post-limiter row is deliberately empty. Fill it from one measured run
-against a real mailbox; do not write in a projected number.
+The row was deliberately left empty for months. It is now filled, and the
+answer is bad: **the adaptive limiter is slower than the pathology it
+replaced**, and slower still than simply pinning the rate. It also collapses
+to `RATE_MIN` on every adaptive run. `docs/PLAN-RATE-LIMITER.md` carries the
+full measurement, the mechanism, and why the offline simulation could not have
+caught it.
+
+Drops were rare but not zero: 6 messages across roughly 14,000 attempts in four
+runs. Two of them are what finally revealed the throttle's actual text, which
+names a **per-minute** budget — the constraint `CLAUDE.md` always described and
+the offline simulation never modelled.
 
 ---
 
@@ -349,10 +360,24 @@ dropped messages, and the fetch reports its observed rate. A run that is fast
 but drops messages is a failure, not a partial success — dropped messages
 silently undercount senders.
 
-**Status:** the offline discrete-event simulation settles at 0.75–0.99x a
+**Status: done-when NOT met.** The offline simulation settles at 0.75–0.99x a
 simulated ceiling and clears the >20 msg/s bar at ceiling 35
-(`test_fleet_clears_the_twenty_messages_per_second_bar`). The real-mailbox
-measurement that fills the empty table row above has not been run yet.
+(`test_fleet_clears_the_twenty_messages_per_second_bar`), but that test asserts
+a property of the simulation rather than of the limiter: `_simulate()` models
+the quota as a trailing **one-second** window, and `CLAUDE.md` states plainly
+that Gmail's is **per minute**. Under a one-second model a rate cut reduces
+throttling proportionally, so AIMD converges by construction.
+
+Measured against a real mailbox on 2026-09-08: **3.7 msg/s sustained at
+concurrency 12**, against a bar of 20, with the limiter collapsing from 3.63 to
+1.00 req/s (`FLOOR`). Pinning the rate with `--rate 8` gave 5.2 msg/s, stable —
+so the adaptive controller is a net loss. Six messages were dropped across the
+four runs.
+
+See `docs/PLAN-RATE-LIMITER.md`, "Measured against a real mailbox", for the
+mechanism: the decrease gate is 2s and the increase gate is 15s, so whenever
+throttles arrive more often than every 15 seconds the increase branch is
+unreachable and the rate can only fall.
 
 ### Phase 2 — server, preflight, scan progress (shipped)
 
