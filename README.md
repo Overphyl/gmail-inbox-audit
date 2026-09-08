@@ -337,7 +337,7 @@ but deferred, and deliberately deferred together — see
 
 **≥ 6 → Trash · 3–5 → Review · < 3 → Keep**
 
-### Safeguards — always demote to Review, never Trash
+### Safeguards — demote Trash to Review, and nothing else
 
 - **replied-to** — the address appears in your sent mail
 - **protected-domain** — banking, government, health, legal, education
@@ -379,6 +379,12 @@ fewer.
 > Safeguards constrain the *ranking*, not your approved list. If you put a
 > protected sender in `approved.txt`, it gets trashed. The guards inform your
 > review; they do not override your decision.
+
+They apply **only** where a sender would otherwise be recommended for Trash.
+A safeguarded sender scoring in Keep range stays in Keep: they were never
+going to be trashed, so calling them out for review would only lengthen the
+list. They still carry `[!]` in the review file, and `--preselect-score` still
+refuses to mark them.
 
 ### `Subject` is deliberately not scored
 

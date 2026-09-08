@@ -1316,12 +1316,18 @@ def rank_rows(msgs, engaged=(), important=IMPORTANT_GUARD_DEFAULT):
     rows = []
     for sender, group in group_by_sender(msgs).items():
         score, signals = score_sender(sender, group)
-        # False-positive safeguards: these demote to Review, never Trash.
+        # False-positive safeguards apply AT THE TRASH BOUNDARY and nowhere
+        # else. A guard exists to stop a Trash recommendation; a sender scoring
+        # below 6 was never going to get one, so guarding them changes no
+        # outcome and only lengthens the list a human has to read. Checking the
+        # guard first - as this did - moved every guarded Keep into Review,
+        # which is a promotion, not a demotion. On the first real mailbox that
+        # was 1,303 senders scoring under 3, or 38% of the review pile, none of
+        # them at any risk. They still carry [!] and --preselect-score still
+        # refuses to mark them; they are simply not called out for review.
         guard = sender_guard(sender, group, engaged, important)
-        if guard:
-            rec = "Review"
-        elif score >= 6:
-            rec = "Trash"
+        if score >= 6:
+            rec = "Review" if guard else "Trash"
         elif score >= 3:
             rec = "Review"
         else:

@@ -87,10 +87,22 @@ hand-written by design.
 disk *before* trashing anything, so an interrupted run still leaves a complete
 undo list for `cmd_untrash`.
 
-**Safeguards demote, never promote.** Senders that are replied-to, on a
-protected domain, starred, or mostly-important are forced to `Review`
-regardless of score. They constrain the *ranking*; they deliberately do not
-override a human's approved list.
+**Safeguards demote, never promote, and apply only at the Trash boundary.**
+Senders that are replied-to, on a protected domain, starred, or
+mostly-important are demoted from `Trash` to `Review`. They constrain the
+*ranking*; they deliberately do not override a human's approved list.
+
+`rank_rows` checks the score first and the guard second, and that order is the
+rule, not a detail. Checking the guard first - as it did until this was
+measured - moved every guarded sender to `Review` from wherever they started,
+including from `Keep`, which is a promotion. A guard exists to stop a `Trash`
+recommendation, and a sender scoring below 6 was never going to get one, so
+the move changed no outcome and only lengthened the list a human reads: on the
+first real mailbox, 1,303 senders scoring under 3, or 38% of the review pile,
+none of them at any risk. A guarded `Keep` still carries `[!]` and is still
+refused by `--preselect-score`; it is simply not called out for review. Three
+tests cover this, one of them asserting the guard still holds at the boundary
+in all four flavours.
 
 **`STARRED` and `IMPORTANT` are not the same evidence, and are not aggregated
 the same way.** A star is a decision the user made and is rare, so `any` across
@@ -161,7 +173,7 @@ docs/SETUP.md             OAuth setup, troubleshooting, platform notes
 docs/DESIGN-UI.md         proposed web UI (not implemented; Phase 1 shipped)
 docs/PLAN-RATE-LIMITER.md how the shared rate limiter works, and why
 docs/images/*.svg         hand-authored setup diagrams
-tests/test_audit.py       89 offline tests, no API access needed
+tests/test_audit.py       92 offline tests, no API access needed
 tests/fixtures/           synthetic headers, example.com domains only
 tests/check_diagrams.py   geometric checks on the SVGs
 ```
