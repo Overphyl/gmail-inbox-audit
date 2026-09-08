@@ -756,6 +756,33 @@ def test_preselect_never_marks_a_safeguarded_sender():
         assert any(marks.values()), "it should still mark the unguarded ones"
 
 
+def test_review_never_truncates_a_long_sender():
+    """A clipped address either fails validation and makes the whole file
+    unreadable, or still looks like an address and silently names a sender
+    that does not exist. Real mail is full of addresses past 43 characters;
+    the example.com fixture has none, which is how this shipped and why a
+    real 5,192-sender file had 62 unparseable rows."""
+    long_sender = "account-security-noreply-department@accountprotection.example.com"
+    assert len(long_sender) > 44
+    rows = [
+        {"sender": long_sender, "count": 12, "score": 8, "signals": ["no-reply"],
+         "rec": "Trash", "guard": None},
+        {"sender": "short@example.com", "count": 3, "score": 0, "signals": [],
+         "rec": "Keep", "guard": "starred/important"},
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "review.txt")
+        g.write_review(p, rows)
+        marks, errors = g.parse_review(p, strict=True)
+        text = open(p, encoding="utf-8").read()
+    assert not errors, errors
+    assert set(marks) == {long_sender, "short@example.com"}, marks
+    assert long_sender in text, "the full address must survive into the file"
+    # ...and the columns still line up behind the longest one.
+    body = [l for l in text.splitlines() if l and not l.startswith("#")]
+    assert len({l.index(" 12 ".strip()) for l in body[:1]}) == 1
+
+
 def test_review_and_senders_file_produce_the_same_targets():
     """DESIGN-UI.md's phase 3 done-when, one layer down: selection through the
     new artifact must equal the set the old one would act on."""

@@ -1397,18 +1397,24 @@ REVIEW_HEADER = """\
 # Re-running rank keeps the marks already in this file, so reviewing in
 # several sittings is safe, and so is fetching more mail part way through.
 #
-# mark flag {sender:<44}{n:>6}{score:>7}  signals
+# mark flag {sender:<{w}}{n:>6}{score:>7}  signals
 """
 
 
-def _review_line(row, mark):
-    return "{}     {:<6}{:<44}{:>6}{:>7}  {}".format(
+def _review_line(row, mark, width=44):
+    # The sender is NEVER truncated. This column is parsed, not just read: a
+    # clipped address either fails validation and makes the whole file
+    # unreadable, or - worse - still looks like an address and silently names
+    # a sender that does not exist. Real addresses run well past 43 characters;
+    # the fixture's example.com ones do not, which is why this shipped.
+    return "{}     {:<6}{:<{w}}{:>6}{:>7}  {}".format(
         mark,
         REVIEW_GUARD_FLAG if row["guard"] else "",
-        row["sender"][:43],
+        row["sender"],
         row["count"],
         row["score"],
         ", ".join(([row["guard"]] if row["guard"] else []) + row["signals"]),
+        w=width,
     ).rstrip()  # a Keep row has no signals; no trailing whitespace
 
 
@@ -1467,6 +1473,9 @@ def write_review(path, rows, preselect_score=0):
     """
     prior, _ = parse_review(path, strict=False) if os.path.exists(path) else ({}, [])
     carried = kept_marked = preselected = 0
+    # Sized to the widest sender present rather than a constant, so the columns
+    # still line up without ever clipping an address.
+    width = max([44] + [len(r["sender"]) for r in rows]) + 2
     body = []
     for row in rows:
         sender = row["sender"]
@@ -1480,7 +1489,7 @@ def write_review(path, rows, preselect_score=0):
             preselected += 1
         else:
             marked = False
-        body.append(_review_line(row, "t" if marked else "."))
+        body.append(_review_line(row, "t" if marked else ".", width))
 
     header = REVIEW_HEADER.format(
         senders=len(rows),
@@ -1488,7 +1497,7 @@ def write_review(path, rows, preselect_score=0):
         when=datetime.datetime.now().isoformat(timespec="minutes"),
         path=path,
         flag=REVIEW_GUARD_FLAG,
-        sender="sender", n="n", score="score",
+        sender="sender", n="n", score="score", w=width,
     )
     # Via a temp file: this reads and rewrites the same path, so a crash part
     # way through would otherwise take the decisions with it.
