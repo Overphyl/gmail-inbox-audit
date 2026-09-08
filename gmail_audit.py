@@ -2184,6 +2184,41 @@ class _UIHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # the live progress line owns stderr
 
+    def handle_one_request(self):
+        # Per request, not per connection: one handler instance serves several.
+        self._body_read = False
+        BaseHTTPRequestHandler.handle_one_request(self)
+
+    def _drain_request_body(self):
+        """Consume any unread request body before replying.
+
+        Windows resets a connection that is closed with bytes still unread in
+        its receive buffer, so the client sees WinError 10053 instead of the
+        response that was actually sent. Every rejection path here replies
+        without looking at the body, which is exactly when this bites: a POST
+        to /api/scan with a bad token or a foreign Origin carries a JSON body
+        nobody reads. The 403 is written correctly and then destroyed by the
+        close, and the page shows a network error in place of the reason.
+
+        Bounded by the same 64 KiB `_read_json` accepts. Past that the body is
+        left unread on purpose: resetting on a client sending megabytes we have
+        already refused is the right outcome.
+        """
+        if self._body_read:
+            return
+        self._body_read = True
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except (ValueError, TypeError):
+            return
+        if n <= 0 or n > 64 * 1024:
+            return
+        while n > 0:
+            chunk = self.rfile.read(min(n, 8192))
+            if not chunk:
+                break
+            n -= len(chunk)
+
     # ------------------------------------------------------------- guards
     def _allowed_hosts(self):
         port = self.server.server_address[1]
@@ -2224,6 +2259,8 @@ class _UIHandler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------ replies
     def _send(self, code, body, ctype):
+        # Before the response, not after: see _drain_request_body.
+        self._drain_request_body()
         raw = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype + "; charset=utf-8")
@@ -2332,6 +2369,9 @@ class _UIHandler(BaseHTTPRequestHandler):
         return {"scan": scan, "progress": progress, "limiter": limiter}
 
     def _read_json(self):
+        # This IS the body consumer, so it claims the read before doing it:
+        # _send must not then try to drain bytes that are already gone.
+        self._body_read = True
         try:
             n = int(self.headers.get("Content-Length") or 0)
         except ValueError:

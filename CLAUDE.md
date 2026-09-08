@@ -187,7 +187,7 @@ docs/SETUP.md             OAuth setup, troubleshooting, platform notes
 docs/DESIGN-UI.md         proposed web UI (not implemented; Phase 1 shipped)
 docs/PLAN-RATE-LIMITER.md how the shared rate limiter works, and why
 docs/images/*.svg         hand-authored setup diagrams
-tests/test_audit.py       99 offline tests, no API access needed
+tests/test_audit.py       101 offline tests, no API access needed
 tests/fixtures/           synthetic headers, example.com domains only
 tests/check_diagrams.py   geometric checks on the SVGs
 ```
@@ -278,6 +278,21 @@ overrides it.
 
 **Force UTF-8 on subprocess output.** Header values routinely contain
 non-ASCII and Windows' cp1252 default raises `UnicodeDecodeError` mid-fetch.
+
+**Windows resets a connection closed with an unread request body.** Closing a
+socket that still has buffered received bytes sends RST rather than FIN, so the
+client gets `WinError 10053` instead of the response the server actually wrote.
+Every rejection path in `_UIHandler` replies without reading the body, which is
+exactly when this bites: a POST to `/api/scan` with a bad token or a foreign
+Origin carries JSON nobody reads, the 403 is written correctly and then
+destroyed by the close, and the page shows a network error in place of the
+reason. `_send()` therefore calls `_drain_request_body()` *before* replying, and
+`_read_json()` claims the body first so it is never read twice - a double read
+blocks forever on bytes that are not coming, which is what four scan tests do
+if you remove that line. Linux cannot show either failure: the bytes are
+already delivered before the close, so the client gets its 403 either way. The
+tests drive the handler against a fake socket and ask the portable question
+(was the body consumed) rather than the platform-specific one.
 
 **Gmail quota is per MINUTE, not per second.** `messages.get` costs 5 units.
 
