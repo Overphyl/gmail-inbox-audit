@@ -493,3 +493,178 @@ guard under real OS threads: seven simultaneous throttles produced a single
 decrease, 8.0 -> 5.6 req/s, not `8 * 0.7^7`. That is stronger evidence than the
 deterministic tests can give, but it is still not proof of the absence of lock
 convoy under load - as the Tests section says, do not claim more than that.
+
+---
+
+## Measured against a real mailbox, 2026-09-08: the adaptive controller fails
+
+Everything above this section was validated in simulation. The first run
+against a real mailbox contradicts it. **The adaptive limiter is strictly
+worse than a fixed rate on that mailbox, and it collapses to `RATE_MIN` every
+time.**
+
+Environment: ~35,000-message inbox, 4,764 sent messages, Windows, `gws` over
+Node, a personal Google Cloud project in Testing mode. Every run below scanned
+the same 4,764 sent messages through `cmd_engaged`.
+
+| Run | Throughput | Throttles/s | Throttled | Limiter rate |
+|---|---|---|---|---|
+| adaptive, concurrency 12 | 3.66 msg/s | 0.75 → 0.81 | 21% of attempts | 3.63 → **1.00 `FLOOR`** |
+| adaptive, concurrency 4 | 3.91 msg/s | 0.48 | 11% of attempts | 8.0 → 2.58, still falling |
+| **pinned `--rate 8`, concurrency 4** | **5.17 msg/s** | **1.31** | 20% of attempts | **8.00, stable** |
+
+Phase 1's done-when required **>20 msg/s sustained with zero dropped
+messages**. Throughput is missed by 4-5x, and the best result came from turning
+the adaptive controller *off*.
+
+**Drops were not zero either**, though they are rare: 6 messages across roughly
+14,000 fetch attempts in four runs, 1-2 per run. An earlier draft of this
+section claimed zero, from mid-run status snapshots that had not yet
+accumulated any. The drop file is the authority, not a snapshot.
+
+### Why it collapses, exactly
+
+```
+decrease gate (THROTTLE_COALESCE) : 2s   -> a decrease may fire every 2s
+increase gate (THROTTLE_HOLD)     : 15s  -> blocked 15s after ANY decrease
+observed throttle spacing         : 1.2s (c12) to 2.1s (c4)
+```
+
+Throttles arrive faster than the hold expires, so `_maybe_increase()` is never
+reached. Only decreases fire, and the rate falls geometrically to `RATE_MIN`.
+
+This is not a tuning error, it is a structural one: **the guard that bounds the
+sawtooth is slower than the guard that permits the cut.** Any workload whose
+throttles arrive more often than once per `THROTTLE_HOLD` collapses, at any
+rate, on any mailbox. The three guards were each reasonable alone; guard 2
+(hold after decrease) and guard 3 (coalesce decreases) were never checked
+against each other.
+
+### The deeper error: throttles here are a cost, not a signal
+
+AIMD assumes a 429 means *the fleet is too fast*, so cutting the rate should
+reduce throttling. Three measurements say otherwise:
+
+1. **A 72% rate cut (3.63 → 1.00 req/s) raised throttle frequency by 7%.**
+   The rate lever is not connected to the throttle source.
+2. **Cutting concurrency 3x halved the throttled *fraction* (21% → 11%) but
+   did not stop the collapse.** Parallelism contributes; it is not the trigger.
+3. **The pinned run absorbed 2.7x more throttling than the adaptive one and
+   delivered 32% more throughput, flat over eight minutes.** A throttled
+   request retries and succeeds; the work still gets through.
+
+So on this mailbox a 429 is a *cost to absorb*, not a signal to retreat. The
+adaptive limiter has been paying the cost of throttling **and** the cost of
+retreating from it, and the retreat buys nothing.
+
+### Why the simulation could not have caught this
+
+`_simulate()` in `tests/test_audit.py` models the quota as a **trailing
+one-second window**: it throttles when arrivals in the last 1.0s reach the
+ceiling. Under that model a rate cut immediately and proportionally reduces
+throttling, so AIMD converges by construction. The test asserting >20 msg/s
+was therefore asserting a property of the simulation, not of the limiter.
+
+`CLAUDE.md` has said the whole time, in its own words, that **"Gmail quota is
+per MINUTE, not per second."** The simulation encodes the shape the
+documentation explicitly says is wrong. Whatever the real constraint is, it has
+a component that request rate does not move.
+
+### What to change
+
+Not yet implemented. The mechanism is now identified (see below), but the
+control law that replaces AIMD-on-rate deserves designing rather than
+guessing, and tuning constants against a half-understood mechanism is how the
+current constants were arrived at.
+
+In rough order of confidence:
+
+1. **Make the decrease gate no shorter than the increase gate.** If
+   `THROTTLE_COALESCE >= THROTTLE_HOLD`, decreases cannot outpace increases and
+   the collapse is structurally impossible. This is the minimal fix and it
+   restores the equilibrium AIMD is supposed to find.
+2. **Close the loop.** Only keep decreasing while the *throttle rate* is
+   actually falling. After N decreases with no measured improvement, stop
+   cutting and say so loudly rather than descending in silence. `FLOOR` should
+   be a reported failure, not a resting state.
+3. **Record the throttle text.** Sample the first few throttle stderrs into the
+   status file. Everything above is inference from counters; the actual message
+   would likely end the guessing in one run.
+4. **Consider making `--rate` the default and adaptive the opt-in.** On the
+   only real evidence that exists, a fixed rate is faster, stable, and simpler.
+   That is an uncomfortable conclusion for a document this long, and it is
+   still the one the numbers support.
+
+### What survives
+
+The parts of this design that are not the controller came through intact:
+
+- **Drop accounting works, and is what finally identified the throttle.** Six
+  drops across four runs, each with its ID, timestamp and error text on disk.
+  The reconciliation and retry budgets behaved as designed.
+- **The deadline scheduler.** No thundering herd, no lock convoy, no worker
+  starvation was observed at any rate between 1.0 and 8.0 req/s.
+- **The `THROTTLE` / `TRANSIENT` split.** Still correct, and now more clearly
+  so: the two failures really are different, and the throttle branch is the one
+  whose *response* is wrong, not its classification.
+- **`--rate` as an escape hatch**, which is what produced the only usable run.
+  `SETUP.md` already documented pinning as the response to `FLOOR`; that advice
+  turns out to be the main path rather than a footnote.
+
+### The throttle, finally read
+
+Throttles are retried until they succeed, so their text never reached the drop
+file and the counters were all we had. Two of the six drops exhausted all
+twelve throttle retries, which put the message on disk for the first time:
+
+```
+error[api]: Quota exceeded for quota metric 'Total Query Cost'
+            and limit 'Units per minute per user'
+            of service 'gmail.googleapis.com'
+```
+
+**`Units per minute per user`.** `CLAUDE.md` had it right the whole time, and
+`_simulate()` had it wrong: the constraint is a per-minute budget, not a
+per-second rate.
+
+That single word changes the shape of the problem. A per-minute bucket is
+depleted by *cumulative units already spent in the current window*, not by the
+instantaneous rate. Once the minute's budget is gone, every request fails until
+the window rolls over — and **cutting the rate does not refund what was already
+spent**. It only guarantees you are also slow when the fresh minute arrives.
+
+That is precisely the measured behaviour: a 72% rate cut raised throttle
+frequency by 7%. The limiter was reacting to a condition that only the clock
+can clear. Worse, `THROTTLE_HOLD` is 15 seconds against a 60-second window, so
+the limiter cuts up to four times inside a single window that no cut could have
+rescued.
+
+**AIMD on instantaneous rate is the wrong controller for this constraint.** A
+controller that fits a per-minute budget would pace against the budget itself:
+spend at most B units per window, track the window boundary, and treat a 429 as
+"this window is spent, idle until it rolls" rather than "reduce the rate
+forever." That is a different algorithm, not a retune, and it is why the fixes
+listed above stop at preventing the collapse rather than claiming to solve it.
+
+### Two things the drop file also exposed
+
+**`gws` prints `Using keyring backend: keyring` to stderr on every single
+invocation**, and it is prepended to every error the tool records. Four of the
+six drops contain *nothing but* that line — a non-zero exit whose only stderr
+was the startup chatter. Those match neither `THROTTLE` nor `TRANSIENT`, so
+they were classified as hard failures, given zero retries, and counted toward
+the circuit breaker. An unclassifiable failure carrying no API error at all is
+more likely transient than permanent, and probably deserves the `TRANSIENT`
+budget rather than immediate death.
+
+**That line also means `gws` re-loads credentials from the OS keyring for every
+message.** If a fresh process also refreshes or validates a token, the real
+quota cost per message is higher than the documented 5 units for
+`messages.get` — which would explain throttling at ~5 msg/s when the default
+per-user budget of 15,000 units/minute should permit roughly ten times that.
+This is a hypothesis, untested, and it bears directly on the "direct HTTPS
+instead of subprocess-per-message — rejected" decision in `DESIGN-UI.md`. That
+decision was taken on the grounds that subprocess overhead was latency the
+limiter could absorb. If the overhead is *quota* rather than latency, the
+premise was wrong and the decision deserves revisiting on its merits — with the
+credential-handling and `--sanitize` objections still standing, unchanged.
