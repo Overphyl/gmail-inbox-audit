@@ -1336,6 +1336,7 @@ def test_ui_scan_runs_the_very_same_fetch_path():
     cache, same resumability, same drop accounting."""
     ids = ["a1", "b2", "c3", "d4"]
     orig_run, orig_limiter, orig_progress = g._run, g.LIMITER, g.PROGRESS
+    orig_cwd = os.getcwd()
     err = io.StringIO()
     try:
         g._run, g.LIMITER = _FakeTransport(ids), None
@@ -1344,25 +1345,40 @@ def test_ui_scan_runs_the_very_same_fetch_path():
                 sanitize=None, cache=os.path.join(d, "headers.jsonl"),
                 batch=1000, dropped=os.path.join(d, "dropped.jsonl"),
             )
-            with contextlib.redirect_stderr(err):
-                with _ui_server(args) as (httpd, port, token):
-                    code, _, _ = _ui_req(
-                        port, "POST", "/api/scan", token=token,
-                        body={"query": "in:inbox", "concurrency": 4, "limit": 0},
-                    )
-                    assert code == 202, code
-                    assert _wait_for(
-                        lambda: httpd.ui_scan.snapshot()["status"] != "running"
-                    ), httpd.ui_scan.snapshot()
-                    state = httpd.ui_scan.snapshot()
-            assert state["status"] == "done", state
-            cached = {m["id"] for m in g.load_cache(args.cache)}
-            assert cached == set(ids), cached
-            assert not os.path.exists(args.dropped), "clean run, no drop file"
-        # A namespace with no --status means disabled. A default guessed here
-        # would write a status file into whatever directory the tests ran in.
-        assert not os.path.exists(g.FETCH_STATUS), (
-            "the suite must not write into the project directory")
+            try:
+                # Run from a scratch cwd. The status assertion below is about
+                # a RELATIVE path, so from the project directory it reads the
+                # fetch-status.json a real scan left there and fails for a
+                # reason that has nothing to do with the code. It passed in CI
+                # and on a fresh clone, and failed the first time it met a
+                # checkout the tool had actually been used in.
+                os.chdir(d)
+                with contextlib.redirect_stderr(err):
+                    with _ui_server(args) as (httpd, port, token):
+                        code, _, _ = _ui_req(
+                            port, "POST", "/api/scan", token=token,
+                            body={"query": "in:inbox", "concurrency": 4,
+                                  "limit": 0},
+                        )
+                        assert code == 202, code
+                        assert _wait_for(
+                            lambda: httpd.ui_scan.snapshot()["status"] != "running"
+                        ), httpd.ui_scan.snapshot()
+                        state = httpd.ui_scan.snapshot()
+                assert state["status"] == "done", state
+                cached = {m["id"] for m in g.load_cache(args.cache)}
+                assert cached == set(ids), cached
+                assert not os.path.exists(args.dropped), "clean run, no drop file"
+                # A namespace with no --status means disabled. Now that the
+                # cwd is scratch, this genuinely tests that: a default guessed
+                # in cmd_fetch would land right here.
+                assert not os.path.exists(g.FETCH_STATUS), (
+                    "no --status means disabled - cmd_fetch must not guess a "
+                    "default and write into the working directory")
+            finally:
+                # Before the tempdir is removed: on Windows a directory cannot
+                # be deleted while it is some process's cwd.
+                os.chdir(orig_cwd)
     finally:
         g._run, g.LIMITER, g.PROGRESS = orig_run, orig_limiter, orig_progress
 
