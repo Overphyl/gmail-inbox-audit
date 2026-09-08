@@ -242,6 +242,33 @@ losing a decision.
 `--preselect-score N` pre-marks unguarded senders scoring at or above `N`. It
 is off by default: the friction being removed is transcription, not judgement.
 
+#### `--min-score N` — the rows worth reading
+
+The file has one row per sender, which on a real mailbox means thousands. Most
+of them are not a decision waiting to be made. Measured on a 5,192-sender
+inbox, the middle tier broke down like this:
+
+| | rows | what it is |
+|---|---|---|
+| Trash | 146 | the tool says go |
+| Review, score ≥ 6 | 185 | a safeguard held back a Trash-scoring sender |
+| Review, score 3–5 | 1,183 | the scorer does not know |
+| Keep | 3,678 | nothing to see |
+
+Only the first two need you. `--min-score 6` writes exactly those:
+
+```bash
+python gmail_audit.py rank --review --min-score 6
+```
+
+331 rows instead of 5,192, on that mailbox.
+
+**It is a view, not a rewrite.** A sender you have already marked is written
+whatever they score, so narrowing can never discard a decision. Re-running
+without the flag brings every row back with your marks intact, and a filtered
+file says `FILTERED` in its header so it cannot be mistaken for a complete one.
+Move between the two as often as you like.
+
 <details>
 <summary>The older <code>--senders approved.txt</code> path still works</summary>
 

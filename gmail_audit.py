@@ -1402,7 +1402,8 @@ def cmd_rank(a):
         summary = write_review(
             a.review, rows,
             preselect_score=getattr(a, "preselect_score", 0),
-            important=getattr(a, "important_guard", IMPORTANT_GUARD_DEFAULT))
+            important=getattr(a, "important_guard", IMPORTANT_GUARD_DEFAULT),
+            min_score=getattr(a, "min_score", 0))
         _report_review(a.review, summary)
         return
 
@@ -1469,10 +1470,21 @@ REVIEW_HEADER = """\
 # and `off` ignores it. STARRED always guards. Re-run rank with a different
 # --important-guard to see the difference - your marks carry over.
 #
-# Re-running rank keeps the marks already in this file, so reviewing in
+{filter}# Re-running rank keeps the marks already in this file, so reviewing in
 # several sittings is safe, and so is fetching more mail part way through.
 #
 # mark flag {sender:<{w}}{n:>6}{score:>7}  signals
+"""
+
+# Printed only for a filtered file. A truncated review file that does not say
+# it is truncated is indistinguishable from a complete one, and the difference
+# is thousands of senders.
+REVIEW_FILTER_NOTE = """\
+# FILTERED to senders scoring {min_score} or more, plus every sender already
+# marked in this file. Not shown: {hidden}. Nothing was lost and nothing was
+# decided for you - re-run without --min-score to see them all, and the marks
+# below come with you.
+#
 """
 
 
@@ -1540,15 +1552,35 @@ def parse_review(path, strict=True):
 
 
 def write_review(path, rows, preselect_score=0,
-                 important=IMPORTANT_GUARD_DEFAULT):
+                 important=IMPORTANT_GUARD_DEFAULT, min_score=0):
     """Write the review file, carrying forward any marks already in it.
 
     Merging is the default and there is no overwrite flag: silently discarding
     a half-finished review is a worse failure than any it would prevent. A
     fresh file is one `rm` away.
+
+    `min_score` hides rows below it, and hides ONLY undecided ones: a sender
+    you have already marked is written whatever they score. That is what makes
+    the filter a view rather than a rewrite. Without that rule, narrowing the
+    file would silently discard decisions already made, and the file is the
+    only record of them - the same failure the no-overwrite rule above exists
+    to prevent, arriving through a different door.
     """
     prior, _ = parse_review(path, strict=False) if os.path.exists(path) else ({}, [])
     carried = kept_marked = preselected = 0
+    # Captured before the filter runs: "dropped" must mean gone from the cache,
+    # never merely hidden by --min-score.
+    in_cache = {r["sender"] for r in rows}
+    # Filter first, so preselect can only ever mark a row that is visible.
+    hidden = 0
+    if min_score:
+        visible = []
+        for row in rows:
+            if row["score"] < min_score and not prior.get(row["sender"]):
+                hidden += 1
+            else:
+                visible.append(row)
+        rows = visible
     # Sized to the widest sender present rather than a constant, so the columns
     # still line up without ever clipping an address.
     width = max([44] + [len(r["sender"]) for r in rows]) + 2
@@ -1575,6 +1607,8 @@ def write_review(path, rows, preselect_score=0,
         flag=REVIEW_GUARD_FLAG,
         sender="sender", n="n", score="score", w=width,
         important=important,
+        filter=(REVIEW_FILTER_NOTE.format(min_score=min_score, hidden=hidden)
+                if min_score else ""),
     )
     # Via a temp file: this reads and rewrites the same path, so a crash part
     # way through would otherwise take the decisions with it.
@@ -1588,9 +1622,17 @@ def write_review(path, rows, preselect_score=0,
         "carried": carried,
         "kept_marked": kept_marked,
         "preselected": preselected,
-        "dropped": len(set(prior) - {r["sender"] for r in rows}),
+        # Two different things, and conflating them would be a lie in the
+        # scarier direction: "dropped" means gone from the cache, "hidden"
+        # means one flag away from coming back.
+        "dropped": len(set(prior) - in_cache),
+        "hidden": hidden,
         "marked": kept_marked + preselected,
     }
+
+
+def _plural(n, word):
+    return "{} {}{}".format(n, word, "" if n == 1 else "s")
 
 
 def _report_review(path, summary):
@@ -1602,6 +1644,10 @@ def _report_review(path, summary):
     if summary["dropped"]:
         print("  {} senders in the old file are no longer in the cache and "
               "were dropped".format(summary["dropped"]))
+    if summary.get("hidden"):
+        print("  not shown: {} below the score filter. Every sender you had "
+              "marked is.".format(
+                  _plural(summary["hidden"], "sender")))
     if summary["preselected"]:
         print("  pre-marked {} senders for trash; safeguarded senders were "
               "NOT marked".format(summary["preselected"]))
@@ -2867,6 +2913,13 @@ def main():
                           "off | majority (default) | any. Gmail applies it "
                           "automatically, so 'any' immunises nearly every "
                           "high-volume sender. STARRED always guards.")
+    r.add_argument("--min-score", type=int, default=0, metavar="N",
+                   help="write only senders scoring >= N, plus every sender "
+                        "already marked in the file. A view, not a rewrite: "
+                        "nothing is decided or discarded, and re-running "
+                        "without it brings the rest back with your marks "
+                        "intact. --min-score 6 is the list the tool actually "
+                        "has an opinion about")
     r.add_argument("--preselect-score", type=int, default=0, metavar="N",
                    help="pre-mark unguarded senders scoring >= N. Safeguarded "
                         "senders are never marked. Off by default, because "

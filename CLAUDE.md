@@ -71,6 +71,20 @@ file that arrives pre-marked on two hundred senders and needs only a save is
 more dangerous than typing two hundred lines. Two tests cover this. Do not add
 a "mark everything recommended" default.
 
+**A filtered review file is a view, never a rewrite.** `--min-score N` hides
+rows below `N` and hides only *undecided* ones: a sender already marked in the
+file is written whatever they score. Without that rule, narrowing the file
+would silently discard decisions already made, and the file is the only record
+of them - the same failure the no-overwrite rule above exists to prevent,
+arriving through a different door. The filter runs *before* preselect, so
+`--preselect-score` can never mark a row the operator was not shown. A filtered
+file says `FILTERED` in its header, because a truncated review file that does
+not say it is truncated is indistinguishable from a complete one and the
+difference is thousands of senders. `hidden` and `dropped` are reported
+separately and must stay that way: hidden means one flag away from coming
+back, dropped means gone from the cache. Four tests cover this, including the
+round trip back out to the full file.
+
 **Safeguards are recomputed, never read off the file.** `cmd_trash` calls
 `sender_guard()` against the cache, so deleting a `[!]` by hand removes the
 marker and not the warning, and overriding one still costs a typed `override`
@@ -173,7 +187,7 @@ docs/SETUP.md             OAuth setup, troubleshooting, platform notes
 docs/DESIGN-UI.md         proposed web UI (not implemented; Phase 1 shipped)
 docs/PLAN-RATE-LIMITER.md how the shared rate limiter works, and why
 docs/images/*.svg         hand-authored setup diagrams
-tests/test_audit.py       95 offline tests, no API access needed
+tests/test_audit.py       99 offline tests, no API access needed
 tests/fixtures/           synthetic headers, example.com domains only
 tests/check_diagrams.py   geometric checks on the SVGs
 ```

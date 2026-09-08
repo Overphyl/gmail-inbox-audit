@@ -945,6 +945,81 @@ def test_review_never_truncates_a_long_sender():
     assert len({l.index(" 12 ".strip()) for l in body[:1]}) == 1
 
 
+def test_min_score_writes_only_the_rows_the_tool_has_an_opinion_about():
+    """5,192 rows is an archive, not a work list. On the first real mailbox,
+    86% of the review pile was score 3-5, where the scorer simply does not
+    know; --min-score 6 leaves the senders recommended for Trash plus the ones
+    a safeguard actually held back."""
+    rows = _review_rows()
+    expected = {r["sender"] for r in rows if r["score"] >= 6}
+    assert 0 < len(expected) < len(rows), "the fixture must exercise both sides"
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "review.txt")
+        summary = g.write_review(p, rows, min_score=6)
+        marks = _marks(p)
+        text = open(p, encoding="utf-8").read()
+    assert set(marks) == expected, set(marks) ^ expected
+    assert summary["hidden"] == len(rows) - len(expected), summary
+    assert summary["dropped"] == 0, "hidden is not dropped"
+    assert "FILTERED" in text, "a truncated file must say it is truncated"
+
+
+def test_min_score_never_hides_a_sender_you_already_marked():
+    """The rule that makes the filter a view rather than a rewrite. Without
+    it, narrowing the file silently discards decisions already made, and the
+    file is the only record of them."""
+    rows = _review_rows()
+    low = min(rows, key=lambda r: r["score"])
+    assert low["score"] < 6, low
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "review.txt")
+        g.write_review(p, rows)                      # full file
+        lines = open(p, encoding="utf-8").read().splitlines()
+        with open(p, "w", encoding="utf-8") as f:    # decide one low-scoring row
+            for l in lines:
+                f.write(("t" + l[1:] if low["sender"] in l else l) + "\n")
+        assert _marks(p)[low["sender"]] is True
+
+        summary = g.write_review(p, rows, min_score=6)   # now narrow it
+        marks = _marks(p)
+    assert marks[low["sender"]] is True, "a decided row must survive the filter"
+    assert summary["kept_marked"] == 1, summary
+
+
+def test_a_filtered_file_widens_again_with_every_mark_intact():
+    """Round trip. Moving between the narrow view and the full file must cost
+    nothing, or the filter is a trap rather than a convenience."""
+    rows = _review_rows()
+    chosen = "news@deals.example.com"
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "review.txt")
+        g.write_review(p, rows, min_score=6)
+        lines = open(p, encoding="utf-8").read().splitlines()
+        with open(p, "w", encoding="utf-8") as f:
+            for l in lines:
+                f.write(("t" + l[1:] if chosen in l else l) + "\n")
+
+        g.write_review(p, rows)                      # widen back out
+        marks = _marks(p)
+        text = open(p, encoding="utf-8").read()
+    assert set(marks) == {r["sender"] for r in rows}, "every sender is back"
+    assert marks[chosen] is True, "the decision survived the round trip"
+    assert "FILTERED" not in text, "an unfiltered file must not claim to be one"
+
+
+def test_min_score_cannot_preselect_a_row_it_hides():
+    """Filter first, then preselect. Marking a sender the operator was never
+    shown is exactly the pre-marked file the review format exists to avoid."""
+    rows = _review_rows()
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "review.txt")
+        summary = g.write_review(p, rows, min_score=6, preselect_score=1)
+        marks = _marks(p)
+    assert all(r >= 6 for r in
+               [row["score"] for row in rows if row["sender"] in marks])
+    assert summary["preselected"] == len([m for m in marks.values() if m])
+
+
 def test_review_and_senders_file_produce_the_same_targets():
     """DESIGN-UI.md's phase 3 done-when, one layer down: selection through the
     new artifact must equal the set the old one would act on."""
