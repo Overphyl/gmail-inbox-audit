@@ -173,7 +173,7 @@ docs/SETUP.md             OAuth setup, troubleshooting, platform notes
 docs/DESIGN-UI.md         proposed web UI (not implemented; Phase 1 shipped)
 docs/PLAN-RATE-LIMITER.md how the shared rate limiter works, and why
 docs/images/*.svg         hand-authored setup diagrams
-tests/test_audit.py       92 offline tests, no API access needed
+tests/test_audit.py       95 offline tests, no API access needed
 tests/fixtures/           synthetic headers, example.com domains only
 tests/check_diagrams.py   geometric checks on the SVGs
 ```
@@ -284,8 +284,15 @@ off a real 429 — so cutting the rate cannot refund units already spent in the
 current minute. A 72% rate cut *raised* throttle frequency by 7%. AIMD on
 instantaneous rate is the wrong controller for a per-minute budget.
 `docs/PLAN-RATE-LIMITER.md`, "Measured against a real mailbox", has the numbers
-and the mechanism. **Until that is fixed, `--rate` is the fast path, not the
-escape hatch.** Do not trust `test_fleet_clears_the_twenty_messages_per_second_bar`:
+and the mechanism.
+
+**So a scan pins `RATE_DEFAULT` (8.0 req/s) and the adaptive controller is
+opt-in behind `--adaptive`.** That is the inversion of what shipped, and it
+stands until the controller is fixed: the broken half must not be what a first
+run gets. `--rate 0` still means "adapt", which is what it has always meant.
+Three tests cover the default, both routes back to adaptive, and the refusal to
+accept `--rate` and `--adaptive` together. Do not trust
+`test_fleet_clears_the_twenty_messages_per_second_bar`:
 `_simulate()` models a trailing one-second window, under which AIMD converges
 by construction.
 

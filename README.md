@@ -400,11 +400,25 @@ displayed.
 Gmail enforces quota **per minute**, not per second. `messages.get` costs 5
 units.
 
-**The tool paces itself.** One rate limiter, shared by every worker, ramps
-until Gmail returns 429s, backs off and settles. The scan prints its current
-rate and state (`ramping`, `backoff 4s`, `at-max`, ...) as it runs. You should
-not normally need to tune anything; `--rate` pins it and `--max-rate` raises
-the ceiling if your project has more quota.
+**The tool paces itself at a fixed 8 req/s.** One rate limiter, shared by every
+worker. The scan prints its current rate and state (`pinned`, `backoff 4s`, ...)
+as it runs. You should not normally need to tune anything; `--rate` changes the
+pin and `--max-rate` raises the ceiling if your project has more quota.
+
+There is also an adaptive controller that searches for the rate, behind
+`--adaptive`. **Do not use it.** Measured against a real mailbox, it collapses
+to the 1.0 req/s floor and is 32% slower than simply pinning:
+
+| run | throughput | throttled | limiter rate |
+|---|---|---|---|
+| `--adaptive`, concurrency 12 | 3.66 msg/s | 21% | 3.63 to **1.00 floor** |
+| `--adaptive`, concurrency 4 | 3.91 msg/s | 11% | 8.0 to 2.58, falling |
+| pinned `--rate 8`, concurrency 4 | **5.17 msg/s** | 20% | **8.00 stable** |
+
+The cause is that quota is per minute, so cutting the rate cannot refund units
+already spent in the current minute: a 72% rate cut *raised* throttle frequency
+by 7%. AIMD on instantaneous rate is the wrong controller for a per-minute
+budget. `docs/PLAN-RATE-LIMITER.md` has the mechanism and what to change.
 
 Rate and concurrency are separate knobs now. The limiter governs the rate;
 `--concurrency` only covers request latency, so about `rate * 0.35` workers are

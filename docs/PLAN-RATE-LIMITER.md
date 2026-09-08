@@ -572,10 +572,9 @@ a component that request rate does not move.
 
 ### What to change
 
-Not yet implemented. The mechanism is now identified (see below), but the
-control law that replaces AIMD-on-rate deserves designing rather than
-guessing, and tuning constants against a half-understood mechanism is how the
-current constants were arrived at.
+Item 4 is **done**. The rest is not, and the control law that replaces
+AIMD-on-rate deserves designing rather than guessing: tuning constants against
+a half-understood mechanism is how the current constants were arrived at.
 
 In rough order of confidence:
 
@@ -590,10 +589,22 @@ In rough order of confidence:
 3. **Record the throttle text.** Sample the first few throttle stderrs into the
    status file. Everything above is inference from counters; the actual message
    would likely end the guessing in one run.
-4. **Consider making `--rate` the default and adaptive the opt-in.** On the
-   only real evidence that exists, a fixed rate is faster, stable, and simpler.
-   That is an uncomfortable conclusion for a document this long, and it is
-   still the one the numbers support.
+4. ~~**Consider making `--rate` the default and adaptive the opt-in.**~~
+   **Done.** On the only real evidence that exists, a fixed rate is faster,
+   stable, and simpler. That is an uncomfortable conclusion for a document this
+   long, and it is still the one the numbers support.
+
+   A scan now pins `RATE_DEFAULT` (8.0 req/s); `--adaptive` opts back in and
+   says in its own help that it is broken. `--rate 0` still means "adapt". The
+   two are mutually exclusive, because silently letting one win is how a run
+   ends up paced by something the operator did not choose.
+
+   8.0 is not a tuned optimum. It is the one rate observed to be stable under
+   load, and the ceiling is unmeasured: no run has been made at 12 or 16 to
+   find where pinning starts drawing throttles faster than it clears requests.
+   That measurement is worth more than any further work on the controller,
+   because it bounds what a correct controller could even achieve. Until then a
+   user with more quota raises it by hand with `--rate`.
 
 ### What survives
 

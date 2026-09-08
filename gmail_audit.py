@@ -106,7 +106,13 @@ def _retryable(stderr):
     return bool(THROTTLE.search(s) or TRANSIENT.search(s))
 
 
-RATE_START = 8.0         # req/s at launch
+RATE_DEFAULT = 8.0       # req/s the scan PINS unless --adaptive is passed.
+                         # Measured against a real mailbox on 2026-09-08: pinned
+                         # here it held 5.17 msg/s where the adaptive controller
+                         # collapsed to the 1.0 floor and managed 3.66. Not a
+                         # tuned optimum, just the fastest thing known to be
+                         # stable. See docs/PLAN-RATE-LIMITER.md.
+RATE_START = 8.0         # req/s at launch of an --adaptive search
 RATE_MIN = 1.0           # never reach zero; also bounds Ctrl-C latency
 RATE_MAX = 40.0          # between the last clean run (35.7/s) and the first
                          # that dropped messages (44.6/s)
@@ -2752,13 +2758,24 @@ UI_HTML = r"""<!doctype html>
 
 def _add_rate_args(sub, dropped_default=None, status_default=None):
     """The pacing knobs, plus the two per-run side files that ride with them."""
-    sub.add_argument("--rate", type=float, default=0.0,
-                     help="pin a fixed req/s; 0 (default) adapts. Throttles "
-                          "still pause but never shrink a pinned rate")
+    # Pinned by default. The adaptive controller is measurably worse than a
+    # fixed rate on a real mailbox, so it is opt-in until it is fixed rather
+    # than the thing every first run gets. --rate 0 still means "adapt", which
+    # is what it has always meant.
+    pacing = sub.add_mutually_exclusive_group()
+    pacing.add_argument("--rate", type=float, default=RATE_DEFAULT,
+                        help="pin a fixed req/s (default %(default)s). "
+                             "Throttles still pause but never shrink a pinned "
+                             "rate. 0 means adapt")
+    pacing.add_argument("--adaptive", action="store_true",
+                        help="search for the rate instead of pinning it. "
+                             "KNOWN BROKEN on a per-minute quota: it collapses "
+                             "to the floor and is slower. See "
+                             "docs/PLAN-RATE-LIMITER.md")
     sub.add_argument("--max-rate", type=float, default=RATE_MAX,
-                     help="ceiling on the adaptive search (default %(default)s)")
+                     help="ceiling on the --adaptive search (default %(default)s)")
     sub.add_argument("--start-rate", type=float, default=RATE_START,
-                     help="initial req/s (default %(default)s); advanced")
+                     help="initial req/s for --adaptive (default %(default)s)")
     sub.add_argument("--no-rate-limit", action="store_true",
                      help="disable pacing entirely - pre-limiter behaviour")
     if dropped_default is not None:
@@ -2776,7 +2793,9 @@ def _make_limiter(a):
     """Resolve the process-wide limiter from the parsed arguments."""
     if not hasattr(a, "max_rate") or getattr(a, "no_rate_limit", False):
         return None
-    pinned = a.rate and a.rate > 0
+    # getattr, not attribute access: the UI and several tests build a namespace
+    # by hand and predate this flag.
+    pinned = a.rate and a.rate > 0 and not getattr(a, "adaptive", False)
     return RateLimiter(
         rate=(a.rate if pinned else a.start_rate),
         burst=RATE_BURST,
