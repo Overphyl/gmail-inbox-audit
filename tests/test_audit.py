@@ -1343,6 +1343,103 @@ def test_ui_rejects_a_foreign_origin():
         assert code == 200, code
 
 
+class _KeepOpen(io.BytesIO):
+    """The handler closes its rfile in finish(); the test still needs to read
+    what was left in it."""
+
+    def close(self):
+        pass
+
+
+class _FakeSocket:
+    """Just enough socket for BaseHTTPRequestHandler, with an observable rfile.
+
+    A real loopback socket cannot show this: on Linux the client gets its 403
+    whether or not the body was read, because the bytes were already delivered
+    before the close. The whole failure is that Windows sends RST instead of
+    FIN when a socket is closed with unread bytes still buffered. So the test
+    asks the portable question directly - did the server consume the body -
+    rather than the platform-specific one.
+    """
+
+    def __init__(self, raw):
+        self.rfile = _KeepOpen(raw)
+        self.sent = bytearray()
+
+    def makefile(self, mode="rb", *a, **k):
+        return self.rfile if "r" in mode else io.BytesIO()
+
+    def sendall(self, b):
+        self.sent.extend(b)
+
+    def settimeout(self, *a):
+        pass
+
+    def shutdown(self, *a):
+        pass
+
+    def close(self):
+        pass
+
+
+def _handle_raw(build, token="test-token-value"):
+    """Run one request through _UIHandler against a fake socket.
+
+    `build(port)` returns the raw bytes; it takes the port because the Host
+    allowlist is built from the server's real address, and a request that gets
+    Host wrong is refused for that reason instead of the one under test.
+    """
+    httpd = g.make_ui_server(port=0, token=token,
+                             args=argparse.Namespace(sanitize=None,
+                                                     cache="headers.jsonl",
+                                                     batch=1000, dropped=""))
+    try:
+        sock = _FakeSocket(build(httpd.server_address[1]))
+        g._UIHandler(sock, ("127.0.0.1", 12345), httpd)
+        return sock, bytes(sock.sent)
+    finally:
+        httpd.server_close()
+
+
+def _raw_post(port, body, extra=""):
+    return ("POST /api/scan HTTP/1.0\r\n"
+            "Host: 127.0.0.1:{}\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: {}\r\n"
+            "{}\r\n".format(port, len(body), extra)).encode() + body
+
+
+def test_ui_reads_the_request_body_even_when_it_refuses_the_request():
+    """Windows resets a connection closed with bytes still unread in its
+    receive buffer, so the client sees WinError 10053 instead of the 403 that
+    was actually sent. Every rejection path replies without looking at the
+    body, which is exactly when it bites: a POST to /api/scan with a bad token
+    or a foreign Origin carries JSON nobody reads, and the page shows a network
+    error in place of the reason it was refused."""
+    body = json.dumps({"query": "in:inbox", "concurrency": 4}).encode()
+    for extra in ("Origin: http://evil.example\r\nX-Audit-Token: test-token-value\r\n",
+                  "X-Audit-Token: wrong\r\n"):
+        sock, sent = _handle_raw(lambda port, e=extra: _raw_post(port, body, e))
+        assert b"403" in sent.split(b"\r\n")[0], (extra, sent[:80])
+        assert b"bad Origin" in sent or b"bad token" in sent, sent[-120:]
+        assert sock.rfile.read() == b"", (
+            "the refused request's body must be consumed before replying, or "
+            "closing the socket resets the connection and destroys the 403")
+
+
+def test_ui_does_not_double_read_a_body_it_already_parsed():
+    """The drain is skipped once _read_json has taken the body. Reading it
+    twice would block on bytes that are never coming."""
+    body = json.dumps({"query": "in:inbox", "concurrency": 99}).encode()
+    sock, sent = _handle_raw(
+        lambda port: _raw_post(port, body,
+                               "X-Audit-Token: test-token-value\r\n"))
+    # 99 is over the drop threshold, so this is refused on its merits - by the
+    # handler that DID read the body, which is the path being covered.
+    assert b"400" in sent.split(b"\r\n")[0], sent[:80]
+    assert sock.rfile.read() == b""
+
+
 def test_ui_rejects_a_foreign_host_header():
     """DNS rebinding: the attacker's name resolves to 127.0.0.1, so the
     connection is genuinely local and only the Host header gives it away."""
