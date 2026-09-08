@@ -97,7 +97,7 @@ Then get the tool:
 ```bash
 git clone https://github.com/Overphyl/gmail-inbox-audit.git
 cd gmail-inbox-audit
-python tests/test_audit.py      # optional: 76 offline tests, no API access
+python tests/test_audit.py      # optional: 81 offline tests, no API access
 ```
 
 ## Setup
@@ -184,6 +184,12 @@ python gmail_audit.py engaged
 
 Scans `in:sent` for everyone you have written to. Senders on this list are
 never recommended for Trash.
+
+**Resumable.** Each scanned message is checkpointed to `engaged-cache.jsonl`,
+so a run you kill (or that dies) picks up where it stopped instead of starting
+over. An incomplete run deliberately writes **no** `engaged.txt`: every later
+step only checks that the file exists, so a partial safeguard list would look
+exactly like a complete one.
 
 > Run this **before** ranking. Without it the safeguard is inactive and people
 > you actively correspond with can be scored as Trash. This is enforced, not
