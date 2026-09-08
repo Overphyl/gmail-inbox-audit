@@ -87,7 +87,8 @@ the offline simulation never modelled.
 - Sustain throughput close to the actual quota ceiling instead of far below it.
   *Shipped in simulation; unmeasured against a real mailbox.*
 - Make repeat runs cheap, so the tool is usable ongoing rather than once.
-  *Open - phase 5, and now the most valuable thing left.*
+  *Partly shipped, and the phase-5 half was aimed at the wrong cadence. See
+  the note under phase 5.*
 - Preserve every existing safety property without exception. *Held.*
 
 ## Non-goals
@@ -308,7 +309,7 @@ record now: it is the input, so it cannot drift from what was actually done.
 | 3 | Selection without transcription | **Shipped as a file, not a table.** `rank --review` / `trash --review`. See below |
 | 3b | Review table in the browser | Optional. A better *view* over the review file; no longer on the critical path |
 | 4 | Execute and undo in the browser | **Deferred.** Not blocked and not declined: it is three layers deep, and the selection model has already moved once. Decide it with 3b |
-| 5 | Incremental history scans | Open. Makes ongoing use cheap, and is now the highest-value remaining item |
+| 5 | Incremental history scans | **Downgraded.** `historyId` expires in about a week, so it cannot serve an annual cadence. The resumable caches already deliver most of it. See below |
 
 The rate limiter led deliberately. It was the problem actually being felt, it
 carried no UI risk, and every later phase is easier to test when a scan takes
@@ -562,6 +563,31 @@ a valid token, or with a foreign `Origin`, is rejected.
 **Done when:** a rescan after an initial full scan completes in seconds and
 finds new mail, with a documented fallback to a full scan when the stored
 `historyId` is too old — Gmail expires them.
+
+**Downgraded from "the highest-value remaining item", and the reason is in that
+done-when.** Gmail expires a `historyId` after roughly a week, sometimes hours.
+This tool's cadence is annual. Every real run would therefore land on the
+documented fallback, which is a full scan: phase 5 would add a history path,
+a stored cursor, an expiry check and a fallback, and then take the fallback
+every single time. It is the right feature for a daily agent and the wrong one
+for a once-a-year audit.
+
+Two things already deliver most of what this phase was for, and they were built
+for other reasons:
+
+- **`headers.jsonl` is resumable and keyed by message ID.** A second `fetch`
+  enumerates IDs and fetches only what it has not seen. The re-enumeration is
+  the cost, not the re-fetch.
+- **`engaged-cache.jsonl` does the same for the sent-mail scan**, which was the
+  longer of the two.
+
+So the honest version of "make repeat runs cheap" is now: the expensive part of
+a repeat run is enumerating IDs, and the fix for *that* is a faster or
+narrower enumeration, not a history cursor. `--query` already narrows it by
+hand.
+
+Build this if the tool ever grows a daily or weekly mode. Until then it is
+open, not next.
 
 ### Keeping this document honest
 

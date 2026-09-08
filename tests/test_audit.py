@@ -427,6 +427,65 @@ def test_rate_never_reaches_zero():
     assert lim.state() == "FLOOR", "a floored limiter must not look routine"
 
 
+def _parse_fetch(argv):
+    """The namespace the real CLI would hand cmd_fetch for `fetch <argv>`.
+
+    Through the actual parser, so a default that only exists in a test cannot
+    disagree with the one a user gets.
+    """
+    orig = sys.argv
+    try:
+        sys.argv = ["gmail_audit.py", "fetch"] + list(argv)
+        parser = None
+        captured = {}
+
+        def fake_fetch(a):
+            captured["a"] = a
+
+        real = g.cmd_fetch
+        g.cmd_fetch = fake_fetch
+        try:
+            try:
+                g.main()
+            except SystemExit:
+                raise
+        finally:
+            g.cmd_fetch = real
+        return captured["a"]
+    finally:
+        sys.argv = orig
+
+
+def test_a_scan_pins_its_rate_by_default():
+    """The adaptive controller is measurably worse than a fixed rate on a real
+    mailbox: it collapses to the 1.0 floor and manages 3.66 msg/s where pinned
+    at 8 held 5.17. Until that is fixed, the broken half is opt-in rather than
+    the thing every first run gets."""
+    a = _parse_fetch([])
+    assert a.rate == g.RATE_DEFAULT and a.adaptive is False, a
+    lim = g._make_limiter(a)
+    assert lim.rate == g.RATE_DEFAULT, lim.rate
+    assert lim.adaptive is False, "the default must not search for a rate"
+
+
+def test_adaptive_is_still_reachable_two_ways():
+    """It is deprecated, not removed. --rate 0 has always meant 'adapt'."""
+    for argv in (["--adaptive"], ["--rate", "0"]):
+        lim = g._make_limiter(_parse_fetch(argv))
+        assert lim.adaptive is True, argv
+        assert lim.rate == g.RATE_START, (argv, lim.rate)
+
+
+def test_rate_and_adaptive_cannot_both_be_asked_for():
+    """Silently letting one win is how a run ends up paced by something the
+    operator did not choose."""
+    try:
+        _parse_fetch(["--rate", "12", "--adaptive"])
+    except SystemExit:
+        return
+    raise AssertionError("--rate and --adaptive must be mutually exclusive")
+
+
 # --------------------------------------------------------------- adaptive
 def test_simultaneous_throttles_decrease_the_rate_once():
     """One overshoot must not tank the fleet.
