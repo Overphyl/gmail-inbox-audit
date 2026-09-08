@@ -1539,7 +1539,19 @@ def parse_review(path, strict=True):
         # A mangled address must not become a silent no-op - that is exactly
         # the failure mode this file exists to remove.
         if addr_of(sender) != sender:
-            errors.append("line {}: {!r} is not an address".format(n, rest[0]))
+            if rest[0] in REVIEW_MARKS:
+                # Far and away the commonest way to get this wrong: the '.' is
+                # left where it is and a 't' added beside it, in the flag
+                # column. "'t' is not an address" is true and useless; the
+                # reader needs to be told where the mark goes.
+                errors.append(
+                    "line {}: the mark is column 1 and nothing else. {!r} "
+                    "looks like a second one - overwrite the leading {!r} "
+                    "rather than adding a mark beside it".format(
+                        n, rest[0], mark))
+            else:
+                errors.append(
+                    "line {}: {!r} is not an address".format(n, rest[0]))
             continue
         if sender in seen:
             errors.append(

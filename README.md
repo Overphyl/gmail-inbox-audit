@@ -232,8 +232,14 @@ t           no-reply@sketchy.example.net             12      9  no-reply, SPF/DK
 .           jane@friend.example.com                   4      0
 ```
 
+The mark is **column 1 and nothing else**: overwrite the leading `.` with a
+`t`, rather than adding a `t` beside it. Everything to the right of it is
+written by the tool.
+
 `[!]` is a safeguarded sender. Nothing pre-marks one, and trashing one costs a
-second deliberate confirmation at execute time.
+second deliberate confirmation at execute time. **Leave it where it is when you
+mark that row** - it is recomputed from the cache at trash time, so deleting it
+removes the marker and not the warning.
 
 Re-running `rank --review` keeps the marks already in the file, so you can
 review across several sittings, or fetch more mail part way through, without

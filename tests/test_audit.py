@@ -1140,6 +1140,35 @@ def test_review_parser_tolerates_hand_editing():
                      "promo@shop.example.com": True}
 
 
+def test_a_mark_in_the_wrong_column_says_so():
+    """The commonest way to get this file wrong: leave the '.' where it is and
+    add a 't' beside it. "'t' is not an address" is true and useless - the
+    reader needs telling where the mark goes."""
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "review.txt")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(".     t     news@deals.example.com\n"        # beside it
+                    ".  {}  t  promo@shop.example.com\n".format(   # past the flag
+                        g.REVIEW_GUARD_FLAG)
+                    + "t           ok@example.com\n")              # correct
+        marks, errors = g.parse_review(p, strict=True)
+    assert marks == {"ok@example.com": True}, marks
+    assert len(errors) == 2, errors
+    for e in errors:
+        assert "column 1" in e, e
+        assert "is not an address" not in e, e
+
+
+def test_a_genuinely_mangled_address_still_reads_as_one():
+    """The clearer message must not swallow the case it was carved out of."""
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "review.txt")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("t     not-an-address\n")
+        _, errors = g.parse_review(p, strict=True)
+    assert len(errors) == 1 and "is not an address" in errors[0], errors
+
+
 def test_trash_recomputes_the_safeguard_rather_than_trusting_the_file():
     """Deleting the [!] flag by hand removes the marker, not the warning."""
     with tempfile.TemporaryDirectory() as d:

@@ -90,6 +90,14 @@ round trip back out to the full file.
 marker and not the warning, and overriding one still costs a typed `override`
 at execute time. Do not "simplify" this into trusting the flag in the file.
 
+**A parse error names the mistake, not just the symptom.** The commonest way
+to get the review file wrong is to leave the `.` where it is and add a `t`
+beside it, in the flag column. `parse_review` checks whether the token it
+rejected is itself a valid mark and says the mark is column 1 and nothing else;
+`'t' is not an address` is true and useless. Two tests: the misplaced mark, and
+a genuinely mangled address, so the clearer message cannot swallow the case it
+was carved out of.
+
 **A marked sender that matches nothing is an error, not a skip.** The review
 file is generated from the cache, so a `t` on a sender with no cached messages
 was typed by hand. A transposed domain is still a syntactically valid address,
@@ -187,7 +195,7 @@ docs/SETUP.md             OAuth setup, troubleshooting, platform notes
 docs/DESIGN-UI.md         proposed web UI (not implemented; Phase 1 shipped)
 docs/PLAN-RATE-LIMITER.md how the shared rate limiter works, and why
 docs/images/*.svg         hand-authored setup diagrams
-tests/test_audit.py       101 offline tests, no API access needed
+tests/test_audit.py       103 offline tests, no API access needed
 tests/fixtures/           synthetic headers, example.com domains only
 tests/check_diagrams.py   geometric checks on the SVGs
 ```
