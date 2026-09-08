@@ -109,6 +109,19 @@ hand-written by design.
 disk *before* trashing anything, so an interrupted run still leaves a complete
 undo list for `cmd_untrash`.
 
+**A mutation count is a count of successes, never of attempts.** `_safe_mutate`
+swallows the error so one bad message cannot abandon the batch, which means the
+loop body runs whether the call worked or not. Both mutating commands used to
+count iterations, so a run in which every single call failed still printed
+"N messages moved to Trash" and exited 0 - the one number a person uses to
+decide whether the mutation worked, wrong only ever in the unsafe direction.
+Count the return value: `_safe_mutate` gives the id on success and `None` on
+failure. `_report_mutations()` is the single closing line for both commands and
+`sys.exit`s when anything failed, because a run that did not do what was asked
+must not end quietly under a success line. Three tests, one of them asserting a
+clean run still exits 0. Do not reintroduce `for _ in ex.map(...)` on a
+mutating path.
+
 **Safeguards demote, never promote, and apply only at the Trash boundary.**
 Senders that are replied-to, on a protected domain, starred, or
 mostly-important are demoted from `Trash` to `Review`. They constrain the
@@ -195,7 +208,7 @@ docs/SETUP.md             OAuth setup, troubleshooting, platform notes
 docs/DESIGN-UI.md         proposed web UI (not implemented; Phase 1 shipped)
 docs/PLAN-RATE-LIMITER.md how the shared rate limiter works, and why
 docs/images/*.svg         hand-authored setup diagrams
-tests/test_audit.py       103 offline tests, no API access needed
+tests/test_audit.py       106 offline tests, no API access needed
 tests/fixtures/           synthetic headers, example.com domains only
 tests/check_diagrams.py   geometric checks on the SVGs
 ```

@@ -1845,7 +1845,7 @@ def cmd_trash(a):
         if resp.strip().lower() != "override":
             sys.exit("stopped - nothing was modified.")
 
-    done = 0
+    done = failed = 0
     for start in range(0, len(targets), a.batch):
         chunk = targets[start : start + a.batch]
         if not a.yes:
@@ -1859,14 +1859,26 @@ def cmd_trash(a):
                     start // a.batch + 1, done))
                 return
         with ThreadPoolExecutor(max_workers=a.concurrency) as ex:
-            for _ in ex.map(
+            for got in ex.map(
                 lambda t: _safe_mutate(_trash_one, t["id"], a.sanitize), chunk
             ):
-                done += 1
-        print("  trashed {}/{}".format(done, len(targets)))
+                # The return value, not the iteration: _safe_mutate swallows
+                # the error so one bad message cannot abandon the batch, which
+                # means the loop runs either way.
+                if got is None:
+                    failed += 1
+                else:
+                    done += 1
+        print("  trashed {}/{}{}".format(
+            done, len(targets), " ({} failed)".format(failed) if failed else ""))
 
-    print("\nDone. {} messages moved to Trash (recoverable for 30 days).".format(done))
     print("To undo: python gmail_audit.py untrash --manifest {}".format(a.manifest))
+    _report_mutations(
+        "Done. {} messages moved to Trash (recoverable for 30 days).",
+        done, failed,
+        "python gmail_audit.py trash --review {} --execute".format(a.review)
+        if getattr(a, "review", None) else
+        "python gmail_audit.py trash --senders {} --execute".format(a.senders))
 
 
 def cmd_untrash(a):
@@ -1883,19 +1895,48 @@ def cmd_untrash(a):
     if not a.execute:
         print("DRY RUN - re-run with --execute to restore.")
         return
-    done = 0
+    done = failed = 0
     with ThreadPoolExecutor(max_workers=a.concurrency) as ex:
-        for _ in ex.map(lambda i: _safe_mutate(_untrash_one, i, a.sanitize), ids):
-            done += 1
-    print("Restored {} messages to the inbox.".format(done))
+        for got in ex.map(lambda i: _safe_mutate(_untrash_one, i, a.sanitize), ids):
+            if got is None:
+                failed += 1
+            else:
+                done += 1
+    _report_mutations(
+        "Restored {} messages to the inbox.", done, failed,
+        "python gmail_audit.py untrash --manifest {} --execute".format(a.manifest))
 
 
 def _safe_mutate(fn, msg_id, sanitize):
+    """Run one mutation. Returns the id on success, None on failure.
+
+    The None is the whole point: a caller that counts iterations rather than
+    return values reports every attempt as a success, which is the one
+    direction this number must never be wrong in.
+    """
     try:
         return fn(msg_id, sanitize)
     except Exception as e:
         print("  ! {}: {}".format(msg_id, e), file=sys.stderr)
         return None
+
+
+def _report_mutations(what, done, failed, retry):
+    """The closing line of a mutating run, and its exit status.
+
+    `what` is a template taking the count, so each command keeps its own words.
+    """
+    print("\n" + what.format(done))
+    if not failed:
+        return
+    # Not a warning tucked under a success line: the run did not do what was
+    # asked. Trash and untrash are both idempotent, and the manifest lists
+    # every target whether or not its call succeeded, so re-running the same
+    # command retries exactly the ones that failed and no-ops the rest.
+    sys.exit(
+        "{} of {} messages FAILED and are unchanged. The errors are the '!' "
+        "lines above.\nThe manifest still lists every target, so retry with:"
+        "\n    {}".format(failed, done + failed, retry))
 
 
 # -------------------------------------------------------------------- main

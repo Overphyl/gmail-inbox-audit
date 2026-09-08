@@ -1231,6 +1231,88 @@ def test_review_header_records_the_important_mode():
     assert "IMPORTANT guard: off" in head, head
 
 
+def _run_mutation(fn, args, fail_ids=()):
+    """Run a mutating command with some message IDs made to fail.
+
+    Returns (stdout, exit_message or None).
+    """
+    def flaky(msg_id, sanitize=None):
+        if msg_id in fail_ids:
+            raise RuntimeError("429 rate limit")
+        return msg_id
+
+    orig_t, orig_u = g._trash_one, g._untrash_one
+    g._trash_one = g._untrash_one = flaky
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                fn(args)
+            except SystemExit as e:
+                return out.getvalue(), str(e)
+        return out.getvalue(), None
+    finally:
+        g._trash_one, g._untrash_one = orig_t, orig_u
+
+
+def _trash_args(d, **kw):
+    review = os.path.join(d, "review.txt")
+    with open(review, "w", encoding="utf-8") as f:
+        f.write("t   news@deals.example.com\n")
+    ns = dict(sanitize=None, review=review, senders="approved.txt", engaged="",
+              allow_missing_engaged=True, cache=FIXTURE,
+              manifest=os.path.join(d, "m.jsonl"), batch=250, concurrency=2,
+              execute=True, yes=True)
+    ns.update(kw)
+    return argparse.Namespace(**ns)
+
+
+def test_a_failed_trash_is_not_counted_as_a_success():
+    """_safe_mutate swallows the error so one bad message cannot abandon the
+    batch, which means the loop body runs either way. Counting iterations
+    rather than return values reported every attempt as a success: a run in
+    which every single call failed still printed "60 messages moved to Trash".
+    That is the one number a person uses to decide whether the mutation
+    worked, and it could only ever be wrong in the unsafe direction."""
+    msgs = [m for m in g.load_cache(FIXTURE)
+            if g.addr_of(m["headers"].get("from", "")) == "news@deals.example.com"]
+    doomed = {m["id"] for m in msgs[:4]}
+    assert len(doomed) == 4 and len(msgs) > 4
+    with tempfile.TemporaryDirectory() as d:
+        out, exit_msg = _run_mutation(g.cmd_trash, _trash_args(d), doomed)
+    assert "{} messages moved to Trash".format(len(msgs) - 4) in out, out[-400:]
+    assert exit_msg is not None, "a partial failure must not exit 0"
+    assert "4 of {} messages FAILED".format(len(msgs)) in exit_msg, exit_msg
+    assert "retry with" in exit_msg and "--execute" in exit_msg, exit_msg
+
+
+def test_a_clean_trash_run_says_so_and_exits_zero():
+    msgs = [m for m in g.load_cache(FIXTURE)
+            if g.addr_of(m["headers"].get("from", "")) == "news@deals.example.com"]
+    with tempfile.TemporaryDirectory() as d:
+        out, exit_msg = _run_mutation(g.cmd_trash, _trash_args(d))
+    assert exit_msg is None, exit_msg
+    assert "{} messages moved to Trash".format(len(msgs)) in out, out[-400:]
+    assert "FAILED" not in out
+
+
+def test_a_failed_untrash_is_not_counted_as_a_success():
+    """The undo path has the same counter and the same consequence: a restore
+    that silently did nothing would be discovered only in Gmail."""
+    with tempfile.TemporaryDirectory() as d:
+        manifest = os.path.join(d, "m.jsonl")
+        ids = ["MSG{}".format(i) for i in range(10)]
+        with open(manifest, "w", encoding="utf-8") as f:
+            for i in ids:
+                f.write(json.dumps({"id": i, "sender": "x@example.com",
+                                    "date": "", "subject": ""}) + "\n")
+        a = argparse.Namespace(sanitize=None, manifest=manifest,
+                               concurrency=2, execute=True)
+        out, exit_msg = _run_mutation(g.cmd_untrash, a, set(ids[:3]))
+    assert "Restored 7 messages to the inbox." in out, out[-300:]
+    assert exit_msg is not None and "3 of 10 messages FAILED" in exit_msg, exit_msg
+
+
 def test_rank_rows_is_the_single_ranking():
     """The table, the JSON and the review file are three renderings of one
     ranking, not three rankings kept in agreement by hand."""
