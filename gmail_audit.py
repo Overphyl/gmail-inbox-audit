@@ -1246,20 +1246,51 @@ def require_engaged(path, allow_missing, action):
     )
 
 
-def sender_guard(sender, group, engaged):
+# How the IMPORTANT label is allowed to safeguard a sender. Gmail applies it
+# automatically and often; STARRED is rare and deliberate. Under `any` - the
+# original behaviour, kept as an option - a sender is immune once ONE of their
+# messages was ever flagged, so for a sender with 100 messages the guard is
+# essentially certain to fire no matter how well calibrated the label is. That
+# is not a safeguard, it is a measurement of group size. On the first real
+# mailbox this shipped against (5,192 senders, 34,953 messages) it immunised
+# 100% of senders with 100+ messages and left 0.5% of the inbox trashable.
+#
+# `majority` keeps the signal where it means something and drops it where it is
+# noise. STARRED is unaffected in every mode.
+IMPORTANT_GUARD_MODES = ("off", "majority", "any")
+IMPORTANT_GUARD_DEFAULT = "majority"
+
+
+def important_guards(group, mode=IMPORTANT_GUARD_DEFAULT):
+    """Does the IMPORTANT label safeguard this sender under `mode`?"""
+    n = sum(1 for m in group if "IMPORTANT" in m["labelIds"])
+    if not n or mode == "off":
+        return False
+    if mode == "any":
+        return True
+    return n * 2 > len(group)  # strict majority
+
+
+def sender_guard(sender, group, engaged, important=IMPORTANT_GUARD_DEFAULT):
     """The false-positive safeguard for one sender, or None.
 
     Shared by cmd_rank and cmd_trash on purpose. cmd_trash recomputes it from
     the cache rather than trusting the [!] flag in a review file, so deleting
     that flag by hand removes the marker but not the warning.
+
+    STARRED and IMPORTANT report separately. They are not the same evidence -
+    one is a decision you made, the other is a guess Gmail made - and with
+    `--important-guard` in play you cannot tell whether changing the mode moves
+    a sender unless the row says which of the two held it.
     """
     if sender in engaged:
         return "replied-to"
     if any(p in sender for p in PROTECTED):
         return "protected-domain"
-    if any("STARRED" in m["labelIds"] or "IMPORTANT" in m["labelIds"]
-           for m in group):
-        return "starred/important"
+    if any("STARRED" in m["labelIds"] for m in group):
+        return "starred"
+    if important_guards(group, important):
+        return "important"
     return None
 
 
@@ -1274,7 +1305,7 @@ def group_by_sender(msgs):
     return by_sender
 
 
-def rank_rows(msgs, engaged=()):
+def rank_rows(msgs, engaged=(), important=IMPORTANT_GUARD_DEFAULT):
     """Score every sender and return the ranked rows.
 
     Returning rows rather than printing them is what lets the table, the JSON
@@ -1286,7 +1317,7 @@ def rank_rows(msgs, engaged=()):
     for sender, group in group_by_sender(msgs).items():
         score, signals = score_sender(sender, group)
         # False-positive safeguards: these demote to Review, never Trash.
-        guard = sender_guard(sender, group, engaged)
+        guard = sender_guard(sender, group, engaged, important)
         if guard:
             rec = "Review"
         elif score >= 6:
@@ -1302,9 +1333,30 @@ def rank_rows(msgs, engaged=()):
             "signals": signals,
             "rec": rec,
             "guard": guard,
+            # Carried whether or not it guarded anything, so a row still shows
+            # what --important-guard would have to work with. Dropping a
+            # safeguard silently is how you get a surprise at trash time.
+            "important": sum(1 for m in group if "IMPORTANT" in m["labelIds"]),
         })
     rows.sort(key=lambda r: (-r["score"], -r["count"]))
     return rows
+
+
+def row_notes(row, with_guard=True):
+    """The guard, the IMPORTANT coverage and the signals, as a human reads them.
+
+    One helper so the table and the review file cannot drift. The coverage is
+    shown even when it guarded nothing: that number is what tells you whether
+    --important-guard any would move this row, and it is the number the
+    majority rule is applied to. `with_guard=False` is for the table, which
+    already prints the guard in its own column.
+    """
+    important = row.get("important", 0)
+    tally = ["important:{}/{}".format(important, row["count"])] if important else []
+    guard = [row["guard"]] if with_guard and row["guard"] else []
+    if row["guard"] == "important":
+        guard = []  # the tally says it better, and says it once
+    return guard + tally + row["signals"]
 
 
 def cmd_rank(a):
@@ -1328,13 +1380,17 @@ def cmd_rank(a):
             file=sys.stderr,
         )
 
-    rows = rank_rows(msgs, engaged)
+    rows = rank_rows(msgs, engaged,
+                     important=getattr(a, "important_guard",
+                                       IMPORTANT_GUARD_DEFAULT))
 
     if getattr(a, "review", None):
         # Guarded above: the table is informational and keeps the warning,
         # but this file is what becomes a trash list.
-        summary = write_review(a.review, rows,
-                               preselect_score=getattr(a, "preselect_score", 0))
+        summary = write_review(
+            a.review, rows,
+            preselect_score=getattr(a, "preselect_score", 0),
+            important=getattr(a, "important_guard", IMPORTANT_GUARD_DEFAULT))
         _report_review(a.review, summary)
         return
 
@@ -1348,7 +1404,8 @@ def cmd_rank(a):
         tag = r["rec"] + ("(" + r["guard"] + ")" if r["guard"] else "")
         print(
             "{:<44}{:>6}{:>7}  {:<26}{}".format(
-                r["sender"][:43], r["count"], r["score"], tag, ", ".join(r["signals"])
+                r["sender"][:43], r["count"], r["score"], tag,
+                ", ".join(row_notes(r, with_guard=False)),
             )
         )
 
@@ -1391,8 +1448,14 @@ REVIEW_HEADER = """\
 #     python gmail_audit.py trash --review {path} --execute
 #
 # {flag} is a safeguarded sender: you have written to them, they are on a
-# protected domain, or you starred them. --preselect-score never marks these,
-# and trashing one takes a keystroke you typed on that row yourself.
+# protected domain, you starred them, or Gmail marks them important.
+# --preselect-score never marks these, and trashing one takes a keystroke you
+# typed on that row yourself.
+#
+# IMPORTANT guard: {important}. Gmail applies that label automatically, so
+# `any` immunises almost every high-volume sender; `majority` is the default
+# and `off` ignores it. STARRED always guards. Re-run rank with a different
+# --important-guard to see the difference - your marks carry over.
 #
 # Re-running rank keeps the marks already in this file, so reviewing in
 # several sittings is safe, and so is fetching more mail part way through.
@@ -1413,7 +1476,7 @@ def _review_line(row, mark, width=44):
         row["sender"],
         row["count"],
         row["score"],
-        ", ".join(([row["guard"]] if row["guard"] else []) + row["signals"]),
+        ", ".join(row_notes(row)),
         w=width,
     ).rstrip()  # a Keep row has no signals; no trailing whitespace
 
@@ -1464,7 +1527,8 @@ def parse_review(path, strict=True):
     return marks, (errors if strict else [])
 
 
-def write_review(path, rows, preselect_score=0):
+def write_review(path, rows, preselect_score=0,
+                 important=IMPORTANT_GUARD_DEFAULT):
     """Write the review file, carrying forward any marks already in it.
 
     Merging is the default and there is no overwrite flag: silently discarding
@@ -1498,6 +1562,7 @@ def write_review(path, rows, preselect_score=0):
         path=path,
         flag=REVIEW_GUARD_FLAG,
         sender="sender", n="n", score="score", w=width,
+        important=important,
     )
     # Via a temp file: this reads and rewrites the same path, so a crash part
     # way through would otherwise take the decisions with it.
@@ -1635,10 +1700,17 @@ def cmd_trash(a):
                     "trash anything")
     engaged = load_engaged(getattr(a, "engaged", ""))
     groups = group_by_sender(msgs)
-    overrides = {
-        s: sender_guard(s, groups[s], engaged)
-        for s in approved if s in groups and sender_guard(s, groups[s], engaged)
-    }
+    # Same --important-guard the ranking used, and for the same reason it is
+    # recomputed at all: the review file records a decision, not a safeguard.
+    # A run that ranked with `off` and trashes with the default simply gets
+    # MORE warnings here, which is the direction to be wrong in.
+    important = getattr(a, "important_guard", IMPORTANT_GUARD_DEFAULT)
+    overrides = {}
+    for s in approved:
+        if s in groups:
+            guard = sender_guard(s, groups[s], engaged, important)
+            if guard:
+                overrides[s] = guard
 
     by_sender = collections.Counter(t["sender"] for t in targets)
     print("Approved senders : {} (from {})".format(len(approved), source))
@@ -1672,9 +1744,9 @@ def cmd_trash(a):
         for s in sorted(overrides):
             print("  {:<48}{:>6}  {}".format(
                 s[:47], by_sender.get(s, 0), overrides[s]))
-        print("  You have written to these, they are on a protected domain, or")
-        print("  you starred them. Nothing pre-marks a safeguarded sender; each")
-        print("  of these was approved by hand.")
+        print("  You have written to these, they are on a protected domain, you")
+        print("  starred them, or Gmail marks them important. Nothing pre-marks a")
+        print("  safeguarded sender; each of these was approved by hand.")
 
     if not targets:
         sys.exit("\nnothing matched - stopping")
@@ -2764,6 +2836,12 @@ def main():
     r.add_argument("--allow-missing-engaged", action="store_true",
                    help="write a review file with the replied-to safeguard "
                         "INACTIVE. Only for a mailbox with no sent mail")
+    r.add_argument("--important-guard", choices=IMPORTANT_GUARD_MODES,
+                     default=IMPORTANT_GUARD_DEFAULT, metavar="MODE",
+                     help="how Gmail's IMPORTANT label safeguards a sender: "
+                          "off | majority (default) | any. Gmail applies it "
+                          "automatically, so 'any' immunises nearly every "
+                          "high-volume sender. STARRED always guards.")
     r.add_argument("--preselect-score", type=int, default=0, metavar="N",
                    help="pre-mark unguarded senders scoring >= N. Safeguarded "
                         "senders are never marked. Off by default, because "
@@ -2789,6 +2867,12 @@ def main():
     t.add_argument("--allow-missing-engaged", action="store_true",
                    help="trash with the replied-to safeguard INACTIVE. Only "
                         "for a mailbox with no sent mail")
+    t.add_argument("--important-guard", choices=IMPORTANT_GUARD_MODES,
+                     default=IMPORTANT_GUARD_DEFAULT, metavar="MODE",
+                     help="how Gmail's IMPORTANT label safeguards a sender: "
+                          "off | majority (default) | any. Gmail applies it "
+                          "automatically, so 'any' immunises nearly every "
+                          "high-volume sender. STARRED always guards.")
     t.add_argument("--cache", default="headers.jsonl")
     t.add_argument("--manifest", default="trashed-manifest.jsonl",
                    help="written before any mutation; used by 'untrash'")

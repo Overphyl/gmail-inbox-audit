@@ -12,13 +12,14 @@ news@deals.example.com             60      8  Trash                     List-Uns
 no-reply@sketchy.example.net       12      9  Trash                     List-Unsubscribe, no-reply, SPF/DKIM fail, volume:12
 alerts@mybank.example.com          30      8  Review(protected-domain)  List-Unsubscribe, Precedence:bulk, no-reply, volume:30
 newsletter@vendor.example.org      25      6  Review(replied-to)        List-Unsubscribe, Precedence:bulk, volume:25
-promo@shop.example.com             15      6  Review(starred/important) List-Unsubscribe, Precedence:bulk, volume:15
+promo@shop.example.com             15      6  Review(starred)           List-Unsubscribe, Precedence:bulk, volume:15
+updates@service.example.com        12      6  Review(important)         important:9/12, List-Unsubscribe, Precedence:bulk
 jane@friend.example.com             4      0  Keep
 ```
 
-Note the middle three: they scored in Trash range and were **demoted to
-Review** because you bank with them, you reply to them, or you starred them.
-That behaviour is the point of this tool.
+Note the middle four: they scored in Trash range and were **demoted to
+Review** because you bank with them, you reply to them, you starred them, or
+Gmail keeps marking them important. That behaviour is the point of this tool.
 
 ---
 
@@ -340,7 +341,40 @@ but deferred, and deliberately deferred together — see
 
 - **replied-to** — the address appears in your sent mail
 - **protected-domain** — banking, government, health, legal, education
-- **starred/important** — any message from them is flagged
+- **starred** — you starred any message from them
+- **important** — Gmail marks *most* of their messages important
+
+#### `--important-guard off | majority | any`
+
+`STARRED` and `IMPORTANT` look alike and are not. A star is a decision you
+made; `IMPORTANT` is a guess Gmail makes automatically, on a lot of mail.
+Asking whether *any* message from a sender was ever flagged is therefore close
+to asking how many messages they sent: for a sender with 100 messages the
+answer is essentially always yes, however well calibrated the label is.
+
+That was the original rule, and on the first real mailbox this ran against
+(5,192 senders, 34,953 messages) it immunised **every** sender with 100 or
+more messages and left 0.5% of the inbox trashable. `majority` — the default —
+keeps the signal where it means something:
+
+| mode | IMPORTANT safeguards a sender when… |
+|---|---|
+| `off` | never |
+| `majority` *(default)* | most of their messages are flagged |
+| `any` | one of their messages is flagged (the original rule) |
+
+Every row shows its `important:N/M` coverage whichever mode is in force, so
+you can see what the setting is working with. `STARRED` guards in all three.
+Re-running `rank --review` **carries your existing marks forward**, so trying
+another mode costs nothing:
+
+```bash
+python gmail_audit.py rank --review --important-guard off
+```
+
+Pass the same flag to `trash`, which recomputes safeguards from the cache
+rather than trusting the file. If the two disagree you get extra warnings, not
+fewer.
 
 > Safeguards constrain the *ranking*, not your approved list. If you put a
 > protected sender in `approved.txt`, it gets trashed. The guards inform your

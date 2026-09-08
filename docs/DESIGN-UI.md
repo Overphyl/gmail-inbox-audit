@@ -286,7 +286,8 @@ convenience:
 - `gmail.modify` scope, so permanent deletion is impossible at the API level.
 - Manifest written before any mutation, so an interrupted run still leaves a
   complete undo list.
-- Replied-to, protected-domain and starred senders demote to Review. The UI
+- Replied-to, protected-domain, starred and mostly-important senders demote to
+  Review (`--important-guard` sets how the last one behaves). The UI
   must make overriding a safeguard a deliberate act, not a checkbox lost among
   two hundred others.
 - `Subject` never contributes to a score.
