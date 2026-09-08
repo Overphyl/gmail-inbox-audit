@@ -138,6 +138,52 @@ def test_important_coverage_is_shown_even_when_it_guards_nothing():
     assert "important:9/12" in notes and "important" not in notes, notes
 
 
+def test_a_safeguard_does_not_promote_a_keep_into_the_review_pile():
+    """A guard exists to stop a Trash recommendation. A sender scoring below
+    the Trash threshold was never going to get one, so guarding them changes
+    no outcome and only lengthens the list a human reads. On the first real
+    mailbox, checking the guard before the score moved 1,303 sub-threshold
+    senders into Review: 38% of the pile, none of them at any risk."""
+    sender = "jane@friend.example.com"
+    plain = _rows()[sender]
+    assert plain["score"] < 3 and plain["rec"] == "Keep", plain
+    guarded = _rows(engaged={sender})[sender]
+    assert guarded["guard"] == "replied-to", guarded
+    assert guarded["rec"] == "Keep", (
+        "a guard below the Trash threshold must not promote the row")
+
+
+def test_a_guarded_keep_still_carries_the_flag_and_stays_unpreselectable():
+    """Not calling a sender out for review is not the same as forgetting they
+    are safeguarded. The [!] and the --preselect-score refusal both survive."""
+    sender = "jane@friend.example.com"
+    rows = _review_rows(engaged={sender})
+    row = next(r for r in rows if r["sender"] == sender)
+    assert row["rec"] == "Keep" and row["guard"] == "replied-to", row
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "review.txt")
+        g.write_review(p, rows, preselect_score=0)  # mark everything it can
+        line = next(l for l in open(p, encoding="utf-8") if sender in l)
+        marks = _marks(p)
+    assert g.REVIEW_GUARD_FLAG in line, line
+    assert marks[sender] is False, "a safeguarded row is never pre-marked"
+
+
+def test_a_safeguard_still_holds_at_the_trash_boundary():
+    """The half that matters. Every guard must still stop a Trash-scoring
+    sender, in both directions of the change."""
+    for sender, engaged in (
+        ("alerts@mybank.example.com", ()),                       # protected
+        ("promo@shop.example.com", ()),                          # starred
+        ("updates@service.example.com", ()),                     # important
+        ("news@deals.example.com", {"news@deals.example.com"}),  # replied-to
+    ):
+        r = _rows(engaged=engaged)[sender]
+        assert r["score"] >= 6, (sender, r)
+        assert r["guard"], (sender, r)
+        assert r["rec"] == "Review", (sender, r)
+
+
 # ------------------------------------------------- structural safety checks
 def test_no_permanent_delete_code_path():
     """The tool must be structurally incapable of permanent deletion."""
