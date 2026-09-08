@@ -305,7 +305,13 @@ opt-in behind `--adaptive`.** That is the inversion of what shipped, and it
 stands until the controller is fixed: the broken half must not be what a first
 run gets. `--rate 0` still means "adapt", which is what it has always meant.
 Three tests cover the default, both routes back to adaptive, and the refusal to
-accept `--rate` and `--adaptive` together. Do not trust
+accept `--rate` and `--adaptive` together. That refusal is deliberately *not* an
+argparse `mutually_exclusive_group`: its message says what is rejected and not
+what to type instead, and since `--rate` now carries a default, "pin at 8 and
+also adapt" is a reasonable thing to have believed you were asking for.
+`_make_limiter` refuses it with the three real choices spelled out. `--rate`
+therefore defaults to `None`, which is the only way to tell a typed `--rate 8`
+from the default, and the conflict is about what was typed. Do not trust
 `test_fleet_clears_the_twenty_messages_per_second_bar`:
 `_simulate()` models a trailing one-second window, under which AIMD converges
 by construction.
