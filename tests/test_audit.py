@@ -28,14 +28,15 @@ FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "headers.jsonl")
 SOURCE = os.path.join(os.path.dirname(__file__), "..", "gmail_audit.py")
 
 
-def _rows(engaged=()):
+def _rows(engaged=(), important=g.IMPORTANT_GUARD_DEFAULT):
     """Rank the fixture and return {sender: row}.
 
     Through rank_rows, deliberately: this helper used to reimplement the
     scoring and safeguard logic, so the safeguard tests could pass against a
     copy while the real ranking regressed.
     """
-    return {r["sender"]: r for r in g.rank_rows(g.load_cache(FIXTURE), engaged)}
+    return {r["sender"]: r
+            for r in g.rank_rows(g.load_cache(FIXTURE), engaged, important)}
 
 
 # ------------------------------------------------------------------ scoring
@@ -78,7 +79,63 @@ def test_starred_sender_demoted():
     r = _rows()["promo@shop.example.com"]
     assert r["score"] >= 6, "fixture should score in Trash range"
     assert r["rec"] == "Review"
-    assert r["guard"] == "starred/important"
+    assert r["guard"] == "starred"
+
+
+def test_starring_guards_in_every_important_mode():
+    """A star is a decision the human made. --important-guard is about the
+    label Gmail applies on its own and must not reach this one."""
+    for mode in g.IMPORTANT_GUARD_MODES:
+        r = _rows(important=mode)["promo@shop.example.com"]
+        assert r["guard"] == "starred", (mode, r)
+        assert r["rec"] == "Review", (mode, r)
+
+
+def test_important_on_a_minority_does_not_guard_by_default():
+    """The measured failure. Gmail applies IMPORTANT automatically, so under
+    `any` a sender is immune once ONE message in their history was flagged -
+    which for a high-volume sender is a near certainty regardless of how well
+    calibrated the label is. On the first real mailbox this ran against, that
+    rule immunised 100% of senders with 100+ messages."""
+    sender = "digest@bulk.example.com"  # 2 of 20 flagged
+    assert _rows(important="any")[sender]["guard"] == "important"
+    assert _rows(important="any")[sender]["rec"] == "Review"
+    for mode in ("majority", "off"):
+        r = _rows(important=mode)[sender]
+        assert r["score"] >= 6, "fixture should score in Trash range"
+        assert r["guard"] is None, (mode, r)
+        assert r["rec"] == "Trash", (mode, r)
+
+
+def test_important_on_a_majority_guards_unless_switched_off():
+    sender = "updates@service.example.com"  # 9 of 12 flagged
+    for mode in ("majority", "any"):
+        r = _rows(important=mode)[sender]
+        assert r["guard"] == "important", (mode, r)
+        assert r["rec"] == "Review", (mode, r)
+    r = _rows(important="off")[sender]
+    assert r["score"] >= 6, "fixture should score in Trash range"
+    assert r["guard"] is None, r
+    assert r["rec"] == "Trash", r
+
+
+def test_the_important_default_is_majority():
+    """Belt and braces: the default is the whole point of the change, and a
+    caller that forgets to pass the mode must not silently get `any` back."""
+    assert g.IMPORTANT_GUARD_DEFAULT == "majority"
+    assert _rows()["digest@bulk.example.com"]["rec"] == "Trash"
+    assert _rows()["updates@service.example.com"]["rec"] == "Review"
+
+
+def test_important_coverage_is_shown_even_when_it_guards_nothing():
+    """Dropping a safeguard silently is how you get a surprise at trash time.
+    The row has to say what --important-guard had to work with."""
+    off = _rows(important="off")["digest@bulk.example.com"]
+    assert "important:2/20" in g.row_notes(off), g.row_notes(off)
+    # ...and it is never spelled twice on a row it did guard.
+    guarded = _rows()["updates@service.example.com"]
+    notes = g.row_notes(guarded)
+    assert "important:9/12" in notes and "important" not in notes, notes
 
 
 # ------------------------------------------------- structural safety checks
@@ -768,7 +825,7 @@ def test_review_never_truncates_a_long_sender():
         {"sender": long_sender, "count": 12, "score": 8, "signals": ["no-reply"],
          "rec": "Trash", "guard": None},
         {"sender": "short@example.com", "count": 3, "score": 0, "signals": [],
-         "rec": "Keep", "guard": "starred/important"},
+         "rec": "Keep", "guard": "starred"},
     ]
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "review.txt")
@@ -916,6 +973,48 @@ def test_trash_recomputes_the_safeguard_rather_than_trusting_the_file():
     text = out.getvalue()
     assert "SAFEGUARD OVERRIDE" in text, text
     assert "protected-domain" in text, text
+
+
+def test_trash_honours_the_important_guard_mode():
+    """cmd_trash recomputes the guard, so it needs the same --important-guard
+    the ranking used. The default is the cautious end: a run that ranked with
+    `off` and trashes without the flag gets MORE warnings, not fewer."""
+    sender = "updates@service.example.com"  # IMPORTANT on 9 of 12
+
+    def override_block(mode):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "review.txt")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("t   {}\n".format(sender))
+            out = io.StringIO()
+            a = argparse.Namespace(
+                sanitize=None, review=p, senders="approved.txt", engaged="",
+                allow_missing_engaged=True, important_guard=mode,
+                cache=FIXTURE, manifest=os.path.join(d, "m.jsonl"), batch=250,
+                concurrency=2, execute=False, yes=True,
+            )
+            with contextlib.redirect_stdout(out):
+                g.cmd_trash(a)
+            return out.getvalue()
+
+    for mode in ("majority", "any"):
+        text = override_block(mode)
+        assert "SAFEGUARD OVERRIDE" in text and "important" in text, (mode, text)
+    text = override_block("off")
+    assert "SAFEGUARD OVERRIDE" not in text, text
+    # ...and the approval is still obeyed either way: safeguards demote the
+    # ranking, they never veto a sender the human listed.
+    assert "Matching messages: 12" in text, text
+
+
+def test_review_header_records_the_important_mode():
+    """The mode changes which senders arrive flagged, so a file that does not
+    say which one produced it cannot be read a week later."""
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "review.txt")
+        g.write_review(p, _review_rows(), important="off")
+        head = open(p, encoding="utf-8").read()
+    assert "IMPORTANT guard: off" in head, head
 
 
 def test_rank_rows_is_the_single_ranking():

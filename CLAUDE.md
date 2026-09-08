@@ -88,9 +88,31 @@ disk *before* trashing anything, so an interrupted run still leaves a complete
 undo list for `cmd_untrash`.
 
 **Safeguards demote, never promote.** Senders that are replied-to, on a
-protected domain, or starred/important are forced to `Review` regardless of
-score. They constrain the *ranking*; they deliberately do not override a
-human's approved list.
+protected domain, starred, or mostly-important are forced to `Review`
+regardless of score. They constrain the *ranking*; they deliberately do not
+override a human's approved list.
+
+**`STARRED` and `IMPORTANT` are not the same evidence, and are not aggregated
+the same way.** A star is a decision the user made and is rare, so `any` across
+a sender's history is the right question. `IMPORTANT` is applied automatically
+by Gmail and is common, so `any` across a hundred messages asks how many
+messages the sender sent, not whether they matter — for a well-calibrated label
+flagging 15% of mail, a 100-message sender is immune with probability ~1. It
+was measured: on the first real mailbox (5,192 senders, 34,953 messages) the
+`any` rule immunised **100%** of senders with 100+ messages and left 0.5% of
+the inbox trashable. `--important-guard` (`off` | `majority` | `any`, default
+`majority`, on both `rank` and `trash`) is the control; `important_guards()`
+is the only place the rule lives. Do not re-merge the two labels into one
+`any()` test, and do not put `STARRED` under the flag. Four tests cover this,
+and the fixture has a minority-flagged and a majority-flagged sender — before
+those, the `IMPORTANT` branch had no fixture coverage at all, which is exactly
+the failure mode this file warns about two sections down.
+
+**A safeguard that did not fire is still shown.** `row_notes()` prints
+`important:N/M` on every row that has any, guarded or not, in the table and in
+the review file. Weakening a safeguard silently is how a surprise arrives at
+trash time; the number is also what tells a user whether another
+`--important-guard` mode would move that row.
 
 **The UI is loopback-only and token-gated.** `http.server` binds `0.0.0.0` by
 default, which would put a scan trigger — and, if phase 4 is ever built, mail
@@ -139,7 +161,7 @@ docs/SETUP.md             OAuth setup, troubleshooting, platform notes
 docs/DESIGN-UI.md         proposed web UI (not implemented; Phase 1 shipped)
 docs/PLAN-RATE-LIMITER.md how the shared rate limiter works, and why
 docs/images/*.svg         hand-authored setup diagrams
-tests/test_audit.py       81 offline tests, no API access needed
+tests/test_audit.py       89 offline tests, no API access needed
 tests/fixtures/           synthetic headers, example.com domains only
 tests/check_diagrams.py   geometric checks on the SVGs
 ```
@@ -160,6 +182,8 @@ tests/check_diagrams.py   geometric checks on the SVGs
 | Scan loop and concurrency | `cmd_fetch()`, `_scan()` |
 | Scoring | `score_sender()`, `BULK_MAILERS`, `NOREPLY`, `PROTECTED` |
 | Ranking and safeguards | `rank_rows()`, `sender_guard()`, `cmd_rank()` |
+| The IMPORTANT-label guard and its modes | `important_guards()`, `IMPORTANT_GUARD_MODES` |
+| Guard + coverage + signals, one rendering | `row_notes()` |
 | The review file, both directions | `write_review()`, `parse_review()`, `load_review_approved()` |
 | Cross-process scan status | `StatusWriter`, `read_status()`, `cmd_status()` |
 | Mutation | `_trash_one()`, `cmd_trash()`, `cmd_untrash()` |
