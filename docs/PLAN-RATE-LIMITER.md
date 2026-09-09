@@ -731,6 +731,14 @@ limiter could absorb. If the overhead is *quota* rather than latency, the
 premise was wrong and the decision deserves revisiting on its merits — with the
 credential-handling and `--sanitize` objections still standing, unchanged.
 
+> **Wrong, and settled the next day.** Both constants in that sentence were
+> off: the budget is 6,000 units/minute per user, not 15,000, and
+> `messages.get` costs 20 units, not 5. `6000 / 20 = 300` messages a minute
+> is exactly the observed ceiling, so there is nothing left for a
+> per-invocation keyring surcharge to explain. Subprocess cost is latency,
+> as `DESIGN-UI.md` assumed, and that decision stands on its original
+> grounds. See "the throttle, diagnosed" at the end of this document.
+
 ---
 
 ## Measured against a real mailbox, 2026-09-09: the throttle, diagnosed
@@ -810,12 +818,20 @@ Contention would of course make it worse, since the budget is per user, but it
 is not needed to explain anything and the original run does not require a
 second process.
 
-**H2 - `messages.get` costs more units than `untrash`/`modify`. Disproved, by
-arithmetic.** If a metadata `get` were the more expensive call, the fetch's
-sustainable rate in calls per minute would have to be *lower* than the
-restore's. It is not. The fetch sustains 300-342 successful calls/min; the
-1,108-message restore ran at 310 calls/min, inside that band. No cost
-asymmetry is needed and none is visible.
+**H2 - `messages.get` costs more units than `untrash`/`modify`. CONFIRMED, and
+it is the whole answer.** Google's published table: `messages.get` costs **20
+units**, `messages.untrash` and `messages.modify` cost **5** each. Equal call
+rates are not equal quota rates, exactly as the hypothesis said.
+
+This document originally argued the opposite here, and the argument was wrong,
+so it is worth naming the error: it reasoned that if `get` were dearer, the
+fetch's sustainable calls/min would have to be *lower* than the restore's, and
+observed that both sat near 310/min. But the restore was never at its ceiling.
+At 5 units a call its ceiling was 1,200 calls/min; it ran at 310 because it was
+latency-bound, using **26% of the budget**. Two workloads landing at similar
+calls/min tells you nothing about their unit cost when only one of them is
+against the wall. Checking a hypothesis against a number that was free to be
+anything is not a test.
 
 **H3 - `list_ids` pagination bursting alongside the per-message fetch.
 Disproved twice over.** The new per-method split counted **zero** `list`
@@ -859,17 +875,36 @@ rather than a rate limit:
    quota are evidently cheap or free, which is why a 60% increase in attempts
    yields no more messages.
 
-The sustainable ceiling is **300 to 314 successful `messages.get` per minute**,
+The sustainable ceiling is **300 successful `messages.get` per minute**,
 bracketed directly: `--rate 5` offers 300/min and draws 3 throttles in an
 entire run; `--rate 6` offers 360/min, is clamped back to 314/min, and draws
 251.
 
-That number also resolves the original puzzle in one line. The pinned fetch and
-the restore did not make calls at the same rate. The fetch was *offering* 8
-req/s and being cut back to 5.17; the restore was latency-bound at 1.55 s/call
-across 8 workers and could only *offer* 5.17. One is an outcome, the other an
-input. The restore drew no throttles because it never asked for more than the
-budget - it sat, by coincidence, just under a ceiling nobody had measured.
+That number is not approximately right, it is exactly the published quota.
+Excluding each run's opening clean phase, which spends a window it did not
+fill, the seven steady-state rates are 286, 297, 299, 299, 302, 305 and 313
+gets/min - a mean of **6,002 units/minute against a published budget of
+6,000**, and every run inside 5%.
+
+That resolves the original puzzle twice over, and both halves matter.
+
+**The unit cost.** The two rows really were at the same *call* rate, 5.17/s,
+and this document estimated both at "~1,550 units per minute at 5 units a
+call". The fetch's half of that estimate was wrong by 4x:
+
+| | calls/s | units/call | units/min | of the 6,000 budget |
+|---|---|---|---|---|
+| pinned `fetch` | 5.17 | **20** | 6,204 | **103%** |
+| `untrash` restore | 5.17 | 5 | 1,551 | 26% |
+
+One run was pressed exactly against the ceiling and the other was at a quarter
+of it. There was never a paradox; there was a wrong constant.
+
+**Offered versus achieved.** The comparison was also not like-for-like. The
+fetch was *offering* 8 req/s and being cut back to 5.17, while the restore was
+latency-bound at 1.55 s/call across 8 workers and could only *offer* 5.17. One
+number is an outcome and the other an input, and they were put in the same
+column.
 
 ### The ceiling above 8 req/s (TODO item 2)
 
@@ -916,29 +951,47 @@ one, and this section is the specification it was waiting for. The minimal
 version is not even adaptive - the budget appears to be a constant, and
 `--rate 5` is already the controller.
 
-### The one number this cannot see from outside
+### The number, read off Google's own table
 
-The observed ceiling is roughly 307 successful metadata `get` calls per minute.
-At the documented cost of 5 units per call that is about **1,535 units per
-minute**, which is 10% of the 15,000 units/minute/user Gmail documents as the
-default. Either
+The remaining question was why the ceiling sat at 10% of the 15,000
+units/minute/user this document assumed. It does not. Both constants in that
+sentence were wrong, and Google publishes the right ones:
 
-- this project's per-user budget really is about 1,500 units/minute, or
-- one `messages.get` through this client costs about **45 to 50 units**, not 5
-  - which is what 15,000 divided by 300-342 works out to.
+- **The per-user budget is 6,000 quota units per minute**, not 15,000. Cloud
+  projects created on or after **1 May 2026** are on the newer, smaller quota;
+  projects that used the API between November 2025 and April 2026 kept the old
+  one. This project is plainly on the new quota, since the old one would have
+  permitted 750 messages/minute.
+- **`messages.get` costs 20 units**, not 5.
 
-The second would be nine times the documented cost, and a candidate mechanism
-is already recorded above: `gws` prints `Using keyring backend: keyring` on
-every single invocation, so it reloads credentials once per message, and a
-process that also refreshes or validates a token is doing billed work this tool
-never counted. That has been a hunch in this document twice. It is now the
-difference between two specific numbers.
+`6000 / 20 = 300` messages per minute, or 5.00 msg/s. That is the ceiling, and
+it is what all seven runs measured.
 
-Nothing inside this tool can separate them - a 429 names the limit, not the
-balance. The Cloud console's quota page for the Gmail API can, in one look, and
-that is the next measurement worth making. It also bears directly on the
-"direct HTTPS instead of subprocess-per-message - rejected" decision in
-`DESIGN-UI.md`: that was rejected on the grounds that subprocess cost was
-latency the limiter could absorb. If it is *quota*, the premise was wrong, and
-the credential-handling and `--sanitize` objections would have to be weighed
-against a nine-fold quota multiplier rather than against convenience.
+| call | units | ceiling at 6,000/min |
+|---|---|---|
+| `messages.list` | 5 | 1,200 pages/min |
+| `messages.get` | **20** | 300 messages/min |
+| `messages.trash` | **20** | 300 messages/min |
+| `messages.untrash` | 5 | - |
+| `messages.modify` | 5 | untrash + modify is 10 units, so 600 messages/min |
+
+Three consequences worth carrying forward:
+
+**A restore is four times cheaper per message than a scan, and a trash run is
+exactly as expensive as one.** `trash --execute` has never been run at a rate
+that would test this, but it is a `messages.get`-priced operation and the same
+300/minute ceiling applies to it.
+
+**The listing is 6% of one minute's budget** - 70 pages at 5 units. That is the
+quantitative version of the H3 disproof.
+
+**The keyring hypothesis is dead, and `DESIGN-UI.md`'s premise survives.** The
+previous section speculated that a `get` might really cost 45-50 units because
+`gws` reloads its keyring on every invocation, and that if the subprocess
+overhead were *quota* rather than latency, the rejection of direct HTTPS was
+taken on a false premise. It is not: 20 units is the published cost and the
+measurements match it to within 5%, leaving nothing for a per-invocation
+surcharge to explain. Subprocess cost is latency, exactly as
+`DESIGN-UI.md` assumed. That decision stands on its original grounds.
+
+Sources: Gmail API [usage limits](https://developers.google.com/workspace/gmail/api/reference/quota).

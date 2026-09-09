@@ -438,7 +438,31 @@ already delivered before the close, so the client gets its 403 either way. The
 tests drive the handler against a fake socket and ask the portable question
 (was the body consumed) rather than the platform-specific one.
 
-**Gmail quota is per MINUTE, not per second.** `messages.get` costs 5 units.
+**Gmail quota is per MINUTE, not per second, and `messages.get` costs 20
+units - not 5.** Measured and then confirmed against Google's published table
+on 2026-09-09. The budget is **6,000 units per minute per user** (the quota for
+Cloud projects created on or after 1 May 2026; older projects kept 15,000), so
+the hard ceiling on a scan is `6000 / 20 =` **300 messages per minute, 5.0
+msg/s**, and no client-side knob raises it. Seven runs across a 3.2x range of
+pinned rate and a 3x range of concurrency all settled within 5% of 6,000
+units/minute.
+
+The per-method costs are not uniform and the differences are large enough to
+change how a command behaves:
+
+| call | units | ceiling at 6,000/min |
+|---|---|---|
+| `messages.list` | 5 | 1,200 pages/min - a 70-page enumeration is 6% of one minute |
+| `messages.get` | **20** | 300 messages/min |
+| `messages.trash` | **20** | 300 messages/min |
+| `messages.untrash` | 5 | - |
+| `messages.modify` | 5 | untrash + modify is 10 units, so 600 messages/min |
+
+So a restore is **four times cheaper per message than a scan**, and a trash run
+is exactly as expensive as a scan. Do not reason about pacing in requests per
+second: the same call rate on two different methods is a different quota rate,
+which is the mistake that made the throttling look inexplicable for a day.
+`docs/PLAN-RATE-LIMITER.md`, "the throttle, diagnosed", has the runs.
 
 *The backoff pathology is fixed; the replacement has its own.* Sustained scans
 used to collapse to ~5 msg/s because per-request exponential backoff idled each

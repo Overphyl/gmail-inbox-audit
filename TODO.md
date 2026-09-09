@@ -108,12 +108,26 @@ rate after being throttled back from an *offered* 8, while the restore was
 latency-bound and only ever *offered* 5.17. It drew no throttles because it sat
 just under a ceiling nobody had measured.
 
-**One number is still unknown and cannot be read from inside this tool.** The
-ceiling is ~307 successful `get`/min, which at the documented 5 units/call is
-1,535 units/min — 10% of Gmail's documented 15,000/min/user. Either this
-project's budget is that small, or one `get` through `gws` costs ~45-50 units
-rather than 5. The Cloud console quota page settles it in one look, and the
-answer bears on the "subprocess per message" decision in `DESIGN-UI.md`.
+**The ceiling is Google's published quota, exactly.** Checked against the
+Gmail API usage-limits table the same day: the per-user budget is **6,000
+quota units per minute** (the quota for Cloud projects created on or after
+1 May 2026; older projects kept 15,000) and **`messages.get` costs 20 units,
+not 5**. `6000 / 20 =` **300 messages/minute = 5.00 msg/s**. Excluding each
+run's opening clean phase, the seven measured steady states average 6,002
+units/minute. Not approximately the quota - the quota.
+
+That also reverses one of the four verdicts above. **H2 was right**:
+`messages.get` (20) really does cost more than `untrash` (5) and `modify` (5),
+and equal call rates are not equal quota rates. The pinned fetch was at 103%
+of budget and the restore at 26%, at the identical 5.17 calls/s. The earlier
+"disproof" compared the fetch's ceiling against a restore that was
+latency-bound at a quarter of its own, which tests nothing.
+
+Costs worth knowing before pacing anything: `list` 5, `get` 20, `trash` **20**,
+`untrash` 5, `modify` 5. A restore is four times cheaper per message than a
+scan; a trash run is exactly as expensive as one; a 70-page enumeration is 6%
+of one minute. The keyring-surcharge hypothesis is dead, and with it the
+suggestion that `DESIGN-UI.md` rejected direct HTTPS on a false premise.
 
 **4. Fix the limiter — now unblocked, and the target has changed.** Item 3
 delivered the mechanism, so this is no longer gated. Read
@@ -151,10 +165,11 @@ backlog.
   measured round trip untouched. If another turns out to be lost, the manifest
   already records every label and that tuple is the one edit.
 - The adaptive limiter is broken and opt-in behind `--adaptive`.
-- **The mailbox is quota-bound at about 5.5 messages/second and no client-side
-  knob raises it.** Measured seven ways on 2026-09-09; the constraint is a
-  per-minute unit budget, not a rate. A full 35,000-message inbox is therefore
-  a ~2 hour scan at best, and the default pacing spends part of that drawing
+- **The mailbox is quota-bound at 300 messages/minute (5.0 msg/s) and no
+  client-side knob raises it.** That is `6,000 quota units per minute per user`
+  divided by the 20 units a `messages.get` costs - Google's published numbers,
+  matched by seven runs to within 5%. A full 35,000-message inbox is therefore
+  a ~2 hour scan at best, and the shipped pacing spends part of that drawing
   throttles and losing one to three messages per two thousand.
 - `engaged.txt` on the reference mailbox is 4,763 of 4,764 sent messages: the
   replied-to safeguard is 99.98% complete, not complete.
@@ -179,10 +194,18 @@ Recorded because each was paid for once and should not be paid for twice.
 - **An error matching neither retry pattern gets zero retries, silently.**
   Three such classes turned up in one day.
 - **A counter cannot tell you why.** Four hypotheses about the throttling stood
-  for a day and all four were wrong; the error text settled it in one run, and
-  `gws()` had been holding that text and discarding it the whole time. When a
-  measurement is confusing, check whether the code is already touching the
-  answer.
+  for a day; the error text settled the mechanism in one run, and `gws()` had
+  been holding that text and discarding it the whole time. When a measurement
+  is confusing, check whether the code is already touching the answer.
+- **Check the published constant before modelling around it.** The whole
+  puzzle came from two wrong numbers - a 15,000 unit/minute budget that is
+  6,000, and a 5-unit `messages.get` that costs 20 - carried in this repo's own
+  documentation for weeks and never looked up. Days of measurement produced a
+  ceiling that one page of Google's docs states outright, and a *plausible*
+  cost of 45-50 units per call had already been derived to explain the gap.
+- **A hypothesis tested against a free variable is not tested.** H2 was
+  "disproved" by comparing a workload pinned against its ceiling with one that
+  was latency-bound at a quarter of its own. It was right all along.
 - **Compare like with like.** The whole puzzle was one table putting an
   *achieved* rate next to an *offered* rate in the same column.
 - **"Everything up-to-date" and "N messages moved" can both be lies.** Check
