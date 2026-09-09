@@ -310,8 +310,18 @@ with `--manifest <path>` to undo that one instead.
 only clears the `TRASH` label; it does not return a message to the inbox, so on
 its own a "restore" leaves everything in All Mail. The manifest records the
 labels each message had, and `untrash` re-adds `INBOX` to the ones that had it.
-Manifests written before this existed cannot say where a message belonged, and
-the command says so rather than leaving you to find out in Gmail.
+Manifests written before this existed cannot say where a message belonged.
+`--cache headers.jsonl` (the default) recovers those labels from the header
+cache the messages were selected from, which recorded them at fetch time. It is
+consulted only for rows the manifest cannot answer, and anything it still
+cannot place is reported rather than left for you to find in Gmail:
+
+```
+Restoring 41 messages from old-manifest.jsonl
+  40 had no labels recorded; filled in from headers.jsonl
+  40 of them will be put back in the inbox
+  1 have no labels here or in headers.jsonl and will land in All Mail, not the inbox.
+```
 
 Both commands print a live progress line with rate and ETA, and publish a
 status file, so `python gmail_audit.py status` reports on a restore running in

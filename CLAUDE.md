@@ -52,6 +52,15 @@ Untrash and relabel are **one unit of work**, not two passes: a message that
 left Trash but never got its `INBOX` back is half restored, and counting it as
 a success would be the same lie as counting attempts.
 
+`untrash --cache` recovers labels for manifest rows that predate label
+recording. The cache those messages were selected from recorded their labels at
+fetch time, so this reads what was written down rather than assuming anything,
+and it is consulted **only** for rows the manifest cannot answer - a manifest
+this version wrote never touches it. That restriction is not an optimisation: a
+cache rebuilt since the trash describes the mailbox now, not the mailbox then,
+which is exactly why the manifest records labels itself. Three tests, one
+asserting the cache is not read when the manifest is complete.
+
 **`--params` and `--json` are different channels.** `--params` carries path and
 query parameters; the request body goes in `--json`. Passing `addLabelIds`
 through `--params` does not fail loudly - `gws` warns that the parameter is not
@@ -269,7 +278,7 @@ docs/SETUP.md             OAuth setup, troubleshooting, platform notes
 docs/DESIGN-UI.md         proposed web UI (not implemented; Phase 1 shipped)
 docs/PLAN-RATE-LIMITER.md how the shared rate limiter works, and why
 docs/images/*.svg         hand-authored setup diagrams
-tests/test_audit.py       122 offline tests, no API access needed
+tests/test_audit.py       124 offline tests, no API access needed
 tests/fixtures/           synthetic headers, example.com domains only
 tests/check_diagrams.py   geometric checks on the SVGs
 ```

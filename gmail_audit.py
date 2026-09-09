@@ -1724,6 +1724,28 @@ def _trash_one(msg_id, sanitize=None):
 RESTORE_LABELS = ("INBOX",)
 
 
+def _fill_labels_from_cache(missing, labels, cache_path):
+    """Recover labels for manifest rows that predate label recording.
+
+    The header cache holds the labelIds of every message it fetched, and the
+    manifest was built from it, so this reads what was recorded rather than
+    assuming anything. It is skipped entirely when the manifest answered for
+    every row, which is the case for anything this version wrote.
+
+    One caveat, and it is why the manifest records labels itself: a cache
+    rebuilt since the trash reflects the mailbox now, not the mailbox then.
+    """
+    if not missing or not cache_path or not os.path.exists(cache_path):
+        return 0
+    want = set(missing)
+    filled = 0
+    for m in load_cache(cache_path):
+        if m.get("id") in want and m.get("labelIds"):
+            labels[m["id"]] = m["labelIds"]
+            filled += 1
+    return filled
+
+
 def _relabel_one(msg_id, labels, sanitize=None):
     """Add labels back to a message. Add-only: see the hard rule in CLAUDE.md.
 
@@ -1961,7 +1983,7 @@ def cmd_untrash(a):
             if len(others) > 1 else ""))
     if not os.path.exists(manifest):
         sys.exit("manifest not found: {}".format(manifest))
-    ids, labels, unlabelled = [], {}, 0
+    ids, labels, missing = [], {}, []
     with open(manifest, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -1972,10 +1994,25 @@ def cmd_untrash(a):
             if "labelIds" in row:
                 labels[row["id"]] = row["labelIds"]
             else:
-                unlabelled += 1
+                missing.append(row["id"])
     print("Restoring {} messages from {}".format(len(ids), manifest))
+
+    # A manifest written before label recording has no idea where its messages
+    # belonged - but the header cache those messages were selected from does,
+    # and it recorded them at fetch time. Reading them is recovery, not a
+    # guess. It only runs for rows the manifest could not answer, so a current
+    # manifest never touches the cache at all.
+    # getattr, not attribute access: several tests and the UI build a
+    # namespace by hand and predate this flag.
+    cache = getattr(a, "cache", "") or ""
+    filled = _fill_labels_from_cache(missing, labels, cache)
+    unlabelled = len(missing) - filled
+
     returning = sum(1 for v in labels.values()
                     if any(l in RESTORE_LABELS for l in v))
+    if filled:
+        print("  {} had no labels recorded; filled in from {}".format(
+            filled, cache))
     if returning:
         print("  {} of them will be put back in the inbox".format(returning))
     if unlabelled:
@@ -1983,9 +2020,8 @@ def cmd_untrash(a):
         # clears TRASH and does not restore INBOX, so without recorded labels
         # these land in All Mail and there is nothing this command can do
         # about it.
-        print("  {} predate label recording and will land in All Mail, not "
-              "the inbox.\n  Move them with a Gmail search and 'Move to "
-              "Inbox'.".format(unlabelled))
+        print("  {} have no labels here or in {} and will land in All Mail, "
+              "not the inbox.".format(unlabelled, cache or "any cache"))
     if not a.execute:
         print("DRY RUN - re-run with --execute to restore.")
         return
@@ -3305,6 +3341,11 @@ def main():
     u.add_argument("--manifest", default=None,
                    help="which run to undo (default: the most recently "
                         "written {}-*.jsonl)".format(MANIFEST_PREFIX))
+    u.add_argument("--cache", default="headers.jsonl",
+                   help="where to recover labels for manifest rows that "
+                        "predate label recording (default %(default)s). Only "
+                        "consulted for rows the manifest cannot answer; pass "
+                        "an empty string to skip it")
     u.add_argument("--concurrency", type=int, default=8)
     u.add_argument("--execute", action="store_true")
     _add_rate_args(u, status_default=UNTRASH_STATUS)

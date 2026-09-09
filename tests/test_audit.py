@@ -1350,7 +1350,7 @@ def test_a_clean_trash_run_says_so_and_exits_zero():
     assert "FAILED" not in out
 
 
-def _restore_from(rows, fail_ids=(), relabel_error=None):
+def _restore_from(rows, fail_ids=(), relabel_error=None, cache=""):
     """Run untrash over a manifest built from `rows`."""
     RELABELS.clear()
     with tempfile.TemporaryDirectory() as d, _in(d):
@@ -1359,7 +1359,7 @@ def _restore_from(rows, fail_ids=(), relabel_error=None):
             for r in rows:
                 f.write(json.dumps(r) + "\n")
         a = argparse.Namespace(sanitize=None, manifest=manifest, concurrency=1,
-                               execute=True, status="")
+                               execute=True, status="", cache=cache)
         out, exit_msg = _run_mutation(g.cmd_untrash, a, set(fail_ids),
                                       relabel_error=relabel_error)
     return out, exit_msg, dict(RELABELS)
@@ -1388,11 +1388,45 @@ def test_a_manifest_without_labels_says_where_the_mail_will_land():
     belonged. Saying so is the difference between a known limitation and a
     person hunting through All Mail wondering what went wrong."""
     out, exit_msg, relabelled = _restore_from(
-        [{"id": "A", "sender": "x@example.com"}, {"id": "B"}])
+        [{"id": "A", "sender": "x@example.com"}, {"id": "B"}], cache="")
     assert exit_msg is None, exit_msg
     assert not relabelled, relabelled
-    assert "2 predate label recording" in out, out
-    assert "All Mail" in out and "Move to Inbox" in out, out
+    assert "2 have no labels" in out, out
+    assert "All Mail" in out, out
+
+
+def test_untrash_recovers_missing_labels_from_the_header_cache():
+    """A manifest written before label recording has no idea where its
+    messages belonged - but the cache those messages were selected from does,
+    and recorded them at fetch time. Reading that back is recovery, not a
+    guess."""
+    msgs = g.load_cache(FIXTURE)[:3]
+    rows = [{"id": m["id"], "sender": "x@example.com"} for m in msgs]
+    rows.append({"id": "NOT-IN-CACHE"})
+    out, exit_msg, relabelled = _restore_from(rows, cache=FIXTURE)
+    assert exit_msg is None, exit_msg
+    assert set(relabelled) == {m["id"] for m in msgs}, relabelled
+    assert all(v == ["INBOX"] for v in relabelled.values()), relabelled
+    assert "3 had no labels recorded; filled in from" in out, out
+    assert "3 of them will be put back in the inbox" in out, out
+    # ...and the one the cache cannot answer for is still reported honestly.
+    assert "1 have no labels" in out, out
+
+
+def test_a_current_manifest_never_reads_the_cache():
+    """The manifest answers for every row, so the cache is not consulted -
+    which matters because a cache rebuilt since the trash describes the
+    mailbox now, not the mailbox then."""
+    called = []
+    orig = g.load_cache
+    g.load_cache = lambda p: called.append(p) or orig(p)
+    try:
+        out, exit_msg, relabelled = _restore_from(
+            [{"id": "A", "labelIds": ["INBOX"]}], cache=FIXTURE)
+    finally:
+        g.load_cache = orig
+    assert not called, "a labelled manifest must not touch the cache"
+    assert relabelled == {"A": ["INBOX"]}, relabelled
 
 
 def test_a_half_restored_message_is_not_a_success():
