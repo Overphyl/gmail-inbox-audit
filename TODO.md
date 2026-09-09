@@ -96,17 +96,18 @@ drains — 144s at `--rate 5`, 20s at `--rate 16` — and then oscillates on a
 
 - **A second process sharing quota**: disproved. The same configuration
   reproduced 488 throttles with nothing else touching the account.
-- **`messages.get` costing more than `untrash`/`modify`**: disproved. The fetch
-  sustains 300-342 calls/min; the restore ran at 310, inside that band.
+- **`messages.get` costing more than `untrash`/`modify`**: *first called
+  disproved, and that was wrong - see the correction below.* It is 20 units
+  against 5, and it is the whole answer.
 - **`list_ids` pagination**: disproved. Zero `list` throttles in seven runs,
   and listing finishes before the first `get` anyway.
 - **Concurrency**: contributes 8% throughput for 79% more throttles, then
   saturates by 8 workers. Not the cause, and it does not move the ceiling.
 
-The original puzzle was a category error: 5.17 msg/s was the fetch's *achieved*
-rate after being throttled back from an *offered* 8, while the restore was
-latency-bound and only ever *offered* 5.17. It drew no throttles because it sat
-just under a ceiling nobody had measured.
+The comparison was also not like-for-like: 5.17 msg/s was the fetch's
+*achieved* rate after being throttled back from an *offered* 8, while the
+restore was latency-bound and only ever *offered* 5.17. One is an outcome, the
+other an input.
 
 **The ceiling is Google's published quota, exactly.** Checked against the
 Gmail API usage-limits table the same day: the per-user budget is **6,000
