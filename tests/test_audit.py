@@ -615,6 +615,21 @@ def test_throttle_and_transient_are_distinguished():
     assert not g.THROTTLE.search("Backend Error")
 
 
+def test_a_precondition_failure_is_transient_not_a_throttle():
+    """A restore untrashes then adds INBOX back, and Gmail occasionally has not
+    committed the untrash when the modify arrives. Measured once in 1,108
+    messages; the retry succeeded by hand, and the message had no SPAM, DRAFT
+    or TRASH label to explain a permanent refusal. Before this it matched
+    neither pattern and got zero retries."""
+    for text in ("error[api]: Precondition check failed.",
+                 "FAILED_PRECONDITION: message is not in trash",
+                 "failed precondition"):
+        assert g.TRANSIENT.search(text), text
+        assert not g.THROTTLE.search(text), (
+            "it is one request losing a race, not the fleet being too fast - "
+            "shrinking the shared rate would be the wrong response")
+
+
 def test_throttle_regex_does_not_match_a_hex_message_id():
     """Gmail message IDs are lowercase hex. A bare 429/500/503 alternative
     matches one inside an error string and turns a hard failure into six

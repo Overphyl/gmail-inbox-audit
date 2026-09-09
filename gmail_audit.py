@@ -95,6 +95,13 @@ THROTTLE = re.compile(
 )
 TRANSIENT = re.compile(
     r"backend error|internal error|service unavailable|deadline exceeded|"
+    # A restore untrashes a message and then adds INBOX back, and Gmail
+    # occasionally has not committed the untrash when the modify arrives:
+    # "Precondition check failed". Measured once in 1,108 messages, and the
+    # retry succeeded by hand, so it is a race and not a property of the
+    # message - that one had no SPAM, DRAFT or TRASH label to explain it.
+    # Before this it matched neither pattern and got ZERO retries.
+    r"failed[ _-]?precondition|precondition check failed|"
     r"\b50[03]\b",
     re.I,
 )

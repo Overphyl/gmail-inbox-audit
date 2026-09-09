@@ -278,7 +278,7 @@ docs/SETUP.md             OAuth setup, troubleshooting, platform notes
 docs/DESIGN-UI.md         proposed web UI (not implemented; Phase 1 shipped)
 docs/PLAN-RATE-LIMITER.md how the shared rate limiter works, and why
 docs/images/*.svg         hand-authored setup diagrams
-tests/test_audit.py       124 offline tests, no API access needed
+tests/test_audit.py       126 offline tests, no API access needed
 tests/fixtures/           synthetic headers, example.com domains only
 tests/check_diagrams.py   geometric checks on the SVGs
 ```
@@ -439,6 +439,16 @@ Two rules that follow, and that a "simplify" pass will be tempted to break:
   is too fast: shrink the shared rate, no local sleep. `TRANSIENT` means one
   request failed: sleep locally, leave the rate alone. Re-merging them into one
   `RETRYABLE` regex silently restores the old pathology.
+- **An error matching neither pattern gets zero retries**, which is correct for
+  a revoked token and wrong for a race. `Precondition check failed` was the
+  third such class found by running for real, after the keyring noise in the
+  drop file: a restore untrashes a message and then adds `INBOX` back, and
+  Gmail occasionally has not committed the untrash when the modify arrives.
+  Measured once in 1,108, and the retry succeeded by hand on a message with no
+  `SPAM`, `DRAFT` or `TRASH` label to explain a permanent refusal, so it is
+  `TRANSIENT` and not `THROTTLE`: one request lost a race, the fleet was not
+  too fast. When a new failure shows up in a drop file or a `!` line, check it
+  against both patterns before assuming it was retried.
 - **One limiter per process, not per pool.** The quota is per-process-per-user,
   so `LIMITER` is a module handle like `GWS`. `cmd_fetch` rebuilds its
   `ThreadPoolExecutor` per batch; per-pool state would re-ramp from the start
