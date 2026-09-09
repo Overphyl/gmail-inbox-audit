@@ -1093,12 +1093,67 @@ That run also exercised two things `TODO.md` listed as never having run for
 real - `trash` on a batch whose manifest records labels, and `untrash --cache`
 - and both were clean.
 
-**One thing is unexplained and is written down rather than guessed at.** The
-restore managed 1.47 msg/s at concurrency 16, where the 1,108-message restore
-on 2026-09-09 managed 2.58 msg/s at concurrency 8. More workers, less
-throughput, no throttles and no drops either time. The live line dipped to 0.9
-msg/s for stretches, which is the signature of `TRANSIENT` retries taking their
-local exponential backoff - `Precondition check failed` is a known race on
-exactly this path. Those retries are invisible: they are counted in the
-limiter's `server_errors` and that field is not in the status payload, so
-nothing on disk can confirm it. Adding it is the cheap next measurement.
+**One thing was unexplained**: the restore managed 1.47 msg/s at concurrency
+16, where the 1,108-message restore earlier that day managed 2.58 msg/s at
+concurrency 8. More workers, less throughput, no throttles and no drops either
+time. The live line dipped to 0.9 msg/s for stretches, which is the signature
+of `TRANSIENT` retries taking their local exponential backoff - and those
+retries were invisible, counted only in a `server_errors` field no command
+published. See the next section: the field was added, and it refuted this.
+
+### The backoff hypothesis, measured and wrong
+
+`server_errors`, a per-method split, sampled texts and a `backoff_seconds`
+accumulator now reach the status file, and `_report_pacing()` is called by all
+four long-running commands - `cmd_trash` and `cmd_untrash` had reported no
+pacing at all, which is backwards, since the question came from a restore.
+
+A controlled A/B on the same 557 messages, trashed and restored twice back to
+back:
+
+| leg | workers | elapsed | throughput | throttles | transient | backoff |
+|---|---|---|---|---|---|---|
+| `trash` | default 8 | 111.1s | 5.01 msg/s | 0 | 0 | 0.0s |
+| `untrash` | **8** | **180.3s** | **3.09 msg/s** | 0 | 0 | 0.0s |
+| `trash` | default 8 | 111.0s | 5.02 msg/s | 0 | 0 | 0.0s |
+| `untrash` | **16** | **343.9s** | **1.62 msg/s** | 0 | 3 | **6.7s** |
+
+The anomaly reproduces exactly - doubling the workers nearly halves the
+throughput - and **backoff does not explain it**. 6.7 seconds of sleep against
+a 163.6-second gap is 4%. The hypothesis this instrumentation was built to
+confirm is refuted by the first run of it, which is the best thing a
+measurement can do.
+
+What the numbers do say is that **per-call latency rises with concurrency on
+this client**:
+
+| workers | calls/s | implied per-call latency |
+|---|---|---|
+| 8 | 6.18 | **1.29 s** |
+| 16 | 3.24 | **4.94 s** |
+
+Doubling the fleet made each call nearly four times slower, so total
+throughput fell. Nothing on the Gmail side is implicated: zero throttles, zero
+drops, 15% of the quota budget. This is the client saturating itself - the tool
+spawns one `gws` process per API call, `gws` is Node and reloads its keyring on
+every invocation, and sixteen of those starting concurrently is a different
+kind of load than eight.
+
+Two consequences:
+
+**The shipped defaults are already on the right side of this.** `trash`,
+`untrash` and `engaged` default to concurrency 8; only `fetch` uses 12, and a
+fetch is quota-bound long before it is latency-bound. The 1.47 msg/s run that
+raised the question was `--concurrency 16`, passed by hand. The tool was right
+and the flag was wrong.
+
+**The 16 hard maximum is about something else, and both limits stand.**
+`CLAUDE.md` caps concurrency at 16 because above that the API silently drops
+messages on `messages.get` - a correctness limit. This is a second, lower,
+throughput ceiling on the mutation path, from an entirely different mechanism.
+Raising mutation concurrency toward 16 is not dangerous, it is just slower.
+
+The remaining unknown is now a narrow one: whether the per-call latency curve
+is CPU, memory, or keyring contention. Measuring it needs process-level
+instrumentation this tool has no business carrying, and it changes no default,
+so it is recorded rather than pursued.

@@ -554,6 +554,21 @@ undercounts senders and corrupts the ranking — a correctness problem, not a
 performance one. The limiter governs rate, not parallelism, and does not repeal
 this. The `fetch` default is 12; 16 remains the hard maximum.
 
+**There is a second, lower concurrency ceiling on the mutation path, and it is
+a different mechanism again.** Measured 2026-09-09 by restoring the same 557
+messages twice, back to back: `untrash` took 180.3s at concurrency 8 and
+343.9s at 16. Doubling the fleet nearly halved throughput, because per-call
+latency rose from 1.29s to 4.94s. Zero throttles and 15% of the quota budget
+either way, so Gmail is not involved - the tool spawns one `gws` process per
+API call, `gws` is Node and reloads its keyring on every invocation, and
+sixteen of those starting at once is a different load from eight. The fleet
+competes with itself for the machine long before it competes for quota.
+
+`trash`, `untrash` and `engaged` therefore default to concurrency **8** and
+should stay there. Raising them toward 16 is not unsafe - that is the other
+ceiling, about the API dropping messages on `messages.get` - it is simply
+slower. Both limits stand and they are not the same limit.
+
 Two rules that follow, and that a "simplify" pass will be tempted to break:
 
 - **A throttle and a 5xx are not the same failure.** `THROTTLE` means the fleet

@@ -160,11 +160,25 @@ green tests never predicted a real run. It now meters units over a minute, and
 reproduces the pathology: pinned at 8 req/s the fleet delivers the same 300
 msg/min while wasting 37.6% of its requests.
 
-**Still open, and small:** `server_errors` is not in the status payload, so
-`TRANSIENT` retries are invisible on disk. The 557-message restore ran at 1.47
-msg/s where an earlier one managed 2.58 with *half* the workers, and the
-likeliest cause is those retries taking local backoff — but nothing recorded
-can confirm it. See the end of `docs/PLAN-RATE-LIMITER.md`.
+**~~Still open:~~ done, and the answer was no.** `server_errors`, a per-method
+split, sampled texts and a `backoff_seconds` accumulator now reach the status
+file, and all four long-running commands report pacing — `trash` and `untrash`
+previously reported none at all, which is backwards given the question came
+from a restore.
+
+A controlled A/B on the same 557 messages **reproduced the anomaly and refuted
+the explanation**: `untrash` at concurrency 8 took 180.3s, at 16 it took
+343.9s, and backoff accounted for 6.7 seconds of the 163.6-second gap — 4%.
+What actually happens is that per-call latency rises with concurrency on this
+client, from 1.29s at 8 workers to 4.94s at 16. Zero throttles and 15% of
+budget either way, so nothing on the Gmail side is involved: the tool spawns
+one `gws` process per API call and saturates the machine.
+
+**No default changes.** `trash`, `untrash` and `engaged` already default to 8.
+The slow run that raised the question was `--concurrency 16` passed by hand.
+Note this is a *second*, lower ceiling than the documented hard maximum of 16,
+which exists because the API drops messages above it — different mechanism,
+and both stand.
 
 ---
 
@@ -235,6 +249,10 @@ Recorded because each was paid for once and should not be paid for twice.
 - **A hypothesis tested against a free variable is not tested.** H2 was
   "disproved" by comparing a workload pinned against its ceiling with one that
   was latency-bound at a quarter of its own. It was right all along.
+- **More workers can mean less work.** Doubling mutation concurrency from 8 to
+  16 nearly halved throughput, because per-call latency rose from 1.29s to
+  4.94s. One `gws` process per API call means the fleet competes with itself
+  for the machine long before it competes for quota.
 - **Compare like with like.** The whole puzzle was one table putting an
   *achieved* rate next to an *offered* rate in the same column.
 - **"Everything up-to-date" and "N messages moved" can both be lies.** Check
