@@ -1071,15 +1071,21 @@ spend the whole budget and draw almost nothing.
 ### Measured against the real mailbox, same day
 
 Three runs on one sender (953 messages, 557 of them in the inbox), which the
-repo owner nominated as an expendable test case. Every run used the shipped
-default - no `--rate`, no `--budget`.
+repo owner nominated as an expendable test case. No `--rate` and no
+`--budget` on any of them; the `untrash` row is the one place a flag was
+passed, `--concurrency 16`, and that turns out to matter - see the A/B below,
+where the same restore at the default of 8 takes 180s instead of 344s.
 
 | run | calls/message | messages | throughput | units/min | of budget | throttles | lost |
 |---|---|---|---|---|---|---|---|
 | `fetch` (get, 20u) | 1 | 900 | 5.02 msg/s | 6,024 | 100% | **0** | **0** |
 | `fetch` (get, 20u) | 1 | 557 | 5.00 msg/s | 6,000 | 100% | **0** | **0** |
 | `trash` (trash, 20u) | 1 | 557 | 5.00 msg/s | 6,004 | 100% | **1** | **0** |
-| `untrash` (untrash+modify, 5u each) | 2 | 557 | 1.47 msg/s | 884 | 15% | **0** | **0** |
+| `untrash` (untrash+modify, 5u each) | 2 | 557 | 1.47 msg/s* | 884 | 15% | **0** | **0** |
+
+*`--concurrency 16`. At the shipped default of 8 the same restore runs at 3.09
+msg/s; the difference is the client, not the quota, and the next section is
+about exactly that.
 
 The first three sit exactly on the ceiling and draw essentially nothing, where
 the same work under `--rate 8` drew 488 throttles and lost 2 messages per

@@ -490,7 +490,7 @@ Measured on a real mailbox with the default pacing:
 |---|---|---|---|---|
 | `fetch` | 5.02 msg/s | 100% | 0 | 0 |
 | `trash` | 5.00 msg/s | 100% | 1 | 0 |
-| `untrash` | 1.47 msg/s | 15% | 0 | 0 |
+| `untrash` | 3.09 msg/s | 15% | 0 | 0 |
 
 `--rate` pins requests per second instead. It is an escape hatch: because it
 ignores what a call costs, it can only be right for one kind of call at a time.
@@ -498,8 +498,15 @@ There is also an adaptive controller behind `--adaptive` that searches for a
 request rate. **Do not use it.** It collapses to the 1.0 req/s floor, and a
 search is the wrong idea anyway - the budget is a published constant.
 
+A restore is four times cheaper per message than a scan, which is why it uses
+only 15% of the budget - there it is your machine, not Gmail, that sets the
+pace.
+
 Rate and concurrency are separate knobs. The budget governs the pace;
-`--concurrency` only covers request latency.
+`--concurrency` only covers request latency. **Raising `--concurrency` on
+`trash` or `untrash` makes them slower**, not faster: at 16 workers instead of
+the default 8, a restore took nearly twice as long, because the tool starts one
+`gws` process per call and they compete with each other.
 
 **Never go above `--concurrency 16`.** Above that the API drops messages, which
 undercounts senders and corrupts the ranking — a correctness problem, not a

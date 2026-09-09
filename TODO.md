@@ -12,6 +12,24 @@ Last updated: 2026-09-09.
 
 ---
 
+## Where this stands
+
+The rate-limiter work is **finished**. The limiter paces Gmail's actual
+constraint - quota units per minute, priced per method - and has been measured
+end to end on a real mailbox across `fetch`, `trash` and `untrash`. Items 2, 3
+and 4 below are closed; `docs/PLAN-RATE-LIMITER.md` has the runs, the numbers
+and the reasoning, and `CLAUDE.md` has the invariants that came out of it.
+
+**The one open task is not a code task.** It is item 1: working through the
+trash candidates, which is the repo owner's judgement to exercise, not a
+contributor's.
+
+If you are picking this up cold: read `CLAUDE.md`'s **Hard rules** first, run
+both suites, and do not start on the "Deferred, deliberately" list without
+asking.
+
+---
+
 ## Start here
 
 ```bash
@@ -64,121 +82,81 @@ exercised both, and all 557 were confirmed back in the inbox by query.
 
 ## Next
 
-**1. Work through the 146 trash candidates.** Not a code task. `rank --review
---min-score 6` writes a 331-row file: 146 recommended for Trash, 185 that a
-safeguard held back. Every batch from here carries labels, so the undo is
-faithful. This is also the first real exercise of `--min-score` and of a
-label-recording manifest.
+**1. Work through the trash candidates.** Not a code task, and the only open
+one. `rank --review --min-score 6` writes a 331-row file: 146 recommended for
+Trash, 185 that a safeguard held back. Every batch carries labels, so the undo
+is faithful. This is still the first real exercise of `--min-score`.
 
-**2. ~~Measure the rate ceiling above 8 req/s.~~ Done, 2026-09-09: there is
-nothing up there.** Seven runs of `fetch --limit 2000` over a throwaway cache,
-one at a time, varying one parameter each. Pinning at 12 gives 5.70 msg/s and
-at 16 gives 5.61, against 5.16 at 8 — and all three lose messages to quota. The
-shipped default (`--rate 8 --concurrency 12`) delivers 5.57 msg/s, within 2.3%
-of the fastest configuration measured anywhere. **`RATE_DEFAULT` should not be
-raised**, and the table is in `docs/PLAN-RATE-LIMITER.md`.
+### Open questions, none urgent
 
-The interesting direction is down. `--rate 5` delivers 5.00 msg/s — 88% of the
-fastest run — for **3 throttles instead of 504, and zero lost messages instead
-of two**. Over a full inbox that is about twenty minutes slower and it is the
-only configuration measured that fetched 2,000 of 2,000. Proposed, not changed:
-it belongs to item 4.
+These are worth a decision, not a sprint. Each is one measurement or one
+conversation, and none blocks anything.
 
-**3. ~~Find out why `fetch` throttles at all.~~ Done, 2026-09-09. All four
-suspects were wrong.** `gws()` now keeps the first five throttle texts per run
-and counts throttles per API method, and the API's own sentence is
-`Quota exceeded ... limit 'Units per minute per user'`.
+- **Does `fetch` still want concurrency 12?** A scan is quota-bound at 5
+  calls/second and per-call latency is ~1.3s, so roughly 7 workers saturate the
+  budget. Twelve was chosen when the constraint was believed to be req/s, and
+  more workers now demonstrably *raise* per-call latency on the mutation path.
+  Nobody has measured whether the same curve bites a fetch. Cheap: two runs.
+- **Do `--rate` and `--adaptive` still earn their place?** Neither is the
+  default any more and `--adaptive` is documented as broken. They are three
+  flags, a mutual-exclusion check and a mode in the limiter. Keeping them is
+  defensible - `--rate` is the escape hatch for a mailbox this tool has not
+  seen - but that is the owner's call, not a cleanup a contributor should make
+  unasked.
+- **What drives per-call latency as concurrency rises?** 1.29s at 8 workers,
+  4.94s at 16, with Gmail uninvolved. Probably `gws` process startup and its
+  per-invocation keyring load. Answering it needs process-level instrumentation
+  this tool has no business carrying, and it changes no default.
+- **Three paths have still never run for real** - see the list above.
 
-The constraint is a **per-minute unit budget spent by successful calls**, not a
-rate limit. Across a 3.2x range of pinned rate and a 3x range of concurrency,
-successes clamp to 300-342 per minute while attempts range 300-479: every extra
-request bought a rejection, not a message. Each run runs clean until the budget
-drains — 144s at `--rate 5`, 20s at `--rate 16` — and then oscillates on a
-60-second period as the window rolls over.
+---
 
-- **A second process sharing quota**: disproved. The same configuration
-  reproduced 488 throttles with nothing else touching the account.
-- **`messages.get` costing more than `untrash`/`modify`**: *first called
-  disproved, and that was wrong - see the correction below.* It is 20 units
-  against 5, and it is the whole answer.
-- **`list_ids` pagination**: disproved. Zero `list` throttles in seven runs,
-  and listing finishes before the first `get` anyway.
-- **Concurrency**: contributes 8% throughput for 79% more throttles, then
-  saturates by 8 workers. Not the cause, and it does not move the ceiling.
+## Recently completed
 
-The comparison was also not like-for-like: 5.17 msg/s was the fetch's
-*achieved* rate after being throttled back from an *offered* 8, while the
-restore was latency-bound and only ever *offered* 5.17. One is an outcome, the
-other an input.
+Summarised, because the detail belongs in the design document rather than in a
+status file. `docs/PLAN-RATE-LIMITER.md` has all of it.
 
-**The ceiling is Google's published quota, exactly.** Checked against the
-Gmail API usage-limits table the same day: the per-user budget is **6,000
-quota units per minute** (the quota for Cloud projects created on or after
-1 May 2026; older projects kept 15,000) and **`messages.get` costs 20 units,
-not 5**. `6000 / 20 =` **300 messages/minute = 5.00 msg/s**. Excluding each
-run's opening clean phase, the seven measured steady states average 6,002
-units/minute. Not approximately the quota - the quota.
+**2. Measure the rate ceiling above 8 req/s.** Done 2026-09-09: there is
+nothing up there. Seven runs of `fetch --limit 2000`, one at a time, varying
+one parameter each. Every configuration between 5 and 16 req/s and between 4
+and 12 workers landed within 14% of the same throughput, because the ceiling
+is not a rate.
 
-That also reverses one of the four verdicts above. **H2 was right**:
-`messages.get` (20) really does cost more than `untrash` (5) and `modify` (5),
-and equal call rates are not equal quota rates. The pinned fetch was at 103%
-of budget and the restore at 26%, at the identical 5.17 calls/s. The earlier
-"disproof" compared the fetch's ceiling against a restore that was
-latency-bound at a quarter of its own, which tests nothing.
+**3. Find out why `fetch` throttles at all.** Done 2026-09-09. `gws()` now
+keeps the first throttle texts per run and counts them per API method, and the
+API's own sentence named the constraint: `Units per minute per user`.
 
-Costs worth knowing before pacing anything: `list` 5, `get` 20, `trash` **20**,
-`untrash` 5, `modify` 5. A restore is four times cheaper per message than a
-scan; a trash run is exactly as expensive as one; a 70-page enumeration is 6%
-of one minute. The keyring-surcharge hypothesis is dead, and with it the
-suggestion that `DESIGN-UI.md` rejected direct HTTPS on a false premise.
+The mechanism is a **per-minute unit budget spent by successful calls**. Two
+constants this repo had carried since its first commit were wrong - the budget
+is 6,000 units/minute, not 15,000, and `messages.get` costs **20** units, not
+5. `6000 / 20 = 300` messages a minute, which is exactly what every run
+measured. Three of the four standing hypotheses were disproved; the fourth
+(that `get` costs more than `untrash`/`modify`) was right, was wrongly
+dismissed first, and is the whole answer.
 
-**4. ~~Fix the limiter.~~ Done, 2026-09-09.** The limiter paces **quota units
-per minute** and charges each call its published price, so one constant
-(`UNITS_PER_MINUTE = 6000`) paces every command correctly: 300 messages/minute
-for a scan or a trash, 1,200 calls/minute for an untrash or a modify. It is not
-adaptive, because a published constant has nothing to search for. `--rate`
-still pins req/s as the escape hatch and `--adaptive` still reaches the broken
-AIMD controller; `--budget` refuses to combine with either.
-
-Measured on the reference mailbox with the shipped default, no flags:
+**4. Fix the limiter.** Done 2026-09-09. It paces quota units per minute and
+charges each call its published price, so one constant paces every command
+correctly: 300 messages/minute for a scan or a trash, 1,200 calls/minute for an
+untrash or a modify. Not adaptive - a published constant has nothing to search
+for. Measured on the reference mailbox with no flags:
 
 | command | messages | throughput | of budget | throttles | lost |
 |---|---|---|---|---|---|
 | `fetch` | 900 | 5.02 msg/s | 100% | 0 | 0 |
 | `fetch` | 557 | 5.00 msg/s | 100% | 0 | 0 |
 | `trash` | 557 | 5.00 msg/s | 100% | 1 | 0 |
-| `untrash` | 557 | 1.47 msg/s | 15% | 0 | 0 |
+| `untrash` | 557 | 3.09 msg/s | 15% | 0 | 0 |
 
 The same fetch work under the old `--rate 8` default drew 488 throttles and
-lost 2 messages per 2,000. The restore is latency-bound at 15% of budget, which
-is the case a single req/s number could never pace: `--rate 8` was 160% of
-budget on a scan and 40% of it on a restore at the same time.
+lost 2 messages per 2,000.
 
-The offline fleet simulation was replaced too. It metered arrivals over a
-trailing *second*, under which AIMD converges by construction — which is why
-green tests never predicted a real run. It now meters units over a minute, and
-reproduces the pathology: pinned at 8 req/s the fleet delivers the same 300
-msg/min while wasting 37.6% of its requests.
-
-**~~Still open:~~ done, and the answer was no.** `server_errors`, a per-method
-split, sampled texts and a `backoff_seconds` accumulator now reach the status
-file, and all four long-running commands report pacing — `trash` and `untrash`
-previously reported none at all, which is backwards given the question came
-from a restore.
-
-A controlled A/B on the same 557 messages **reproduced the anomaly and refuted
-the explanation**: `untrash` at concurrency 8 took 180.3s, at 16 it took
-343.9s, and backoff accounted for 6.7 seconds of the 163.6-second gap — 4%.
-What actually happens is that per-call latency rises with concurrency on this
-client, from 1.29s at 8 workers to 4.94s at 16. Zero throttles and 15% of
-budget either way, so nothing on the Gmail side is involved: the tool spawns
-one `gws` process per API call and saturates the machine.
-
-**No default changes.** `trash`, `untrash` and `engaged` already default to 8.
-The slow run that raised the question was `--concurrency 16` passed by hand.
-Note this is a *second*, lower ceiling than the documented hard maximum of 16,
-which exists because the API drops messages above it — different mechanism,
-and both stand.
+**5. Make the transient retries visible.** Done 2026-09-09, after the restore
+above raised a question no counter could answer. `server_errors`, a per-method
+split, sampled texts and a `backoff_seconds` accumulator reach the status file,
+and all four long-running commands report pacing - `trash` and `untrash`
+previously reported none at all. Its first use refuted the hypothesis it was
+built to confirm: backoff explained 4% of the anomaly it was meant to explain,
+and per-call latency rising with concurrency explained the rest.
 
 ---
 
@@ -211,13 +189,22 @@ backlog.
 - **The mailbox is quota-bound at 300 messages/minute (5.0 msg/s) and no
   client-side knob raises it.** That is `6,000 quota units per minute per user`
   divided by the 20 units a `messages.get` costs - Google's published numbers,
-  matched by seven runs to within 5%. A full 35,000-message inbox is therefore
-  a ~2 hour scan at best, and the shipped pacing spends part of that drawing
-  throttles and losing one to three messages per two thousand.
+  matched by seven runs to within 5%. A full 35,000-message inbox is a ~2 hour
+  scan, and that is the API's floor rather than the tool's: the shipped pacing
+  now spends the whole budget and draws essentially nothing.
+- A restore is four times cheaper per message than a scan (`untrash` and
+  `modify` cost 5 units each against a `get`'s 20), and a `trash` costs exactly
+  as much as a scan. Any reasoning about how long something will take starts
+  there, not with requests per second.
 - `engaged.txt` on the reference mailbox is 4,763 of 4,764 sent messages: the
   replied-to safeguard is 99.98% complete, not complete.
 - Concurrency above ~16 makes the API drop messages. The `fetch` default is 12
   and 16 is the hard maximum. This is a correctness problem, not a speed one.
+- Separately and for a different reason, concurrency above ~8 makes the
+  *mutation* path slower: per-call latency rose from 1.29s to 4.94s between 8
+  and 16 workers, with Gmail uninvolved. `trash`, `untrash` and `engaged`
+  default to 8 and should stay there. Two ceilings, two mechanisms; see
+  `CLAUDE.md`.
 
 ---
 
