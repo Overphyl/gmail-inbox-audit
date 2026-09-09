@@ -16,6 +16,13 @@ progress; it is phase 2 of `docs/DESIGN-UI.md` and has no mutating endpoint.
 `status` reports on a scan running in another terminal by reading the file the
 scan publishes.
 
+## Where the project is
+
+`TODO.md` records what has been verified against a real mailbox, what is next,
+and what is deferred on purpose. Read it before deciding what to work on, and
+update it in the same commit as any change to that state. It is the answer to
+"what should I do next"; this file is the answer to "what must I not break".
+
 ## Hard rules
 
 These are safety properties, not preferences. Do not relax any of them for
@@ -274,11 +281,12 @@ it would abort long runs on a healthy mailbox. Two tests, one per direction.
 
 ```
 gmail_audit.py            the entire tool
+TODO.md                   project state: verified, next, deferred
 docs/SETUP.md             OAuth setup, troubleshooting, platform notes
 docs/DESIGN-UI.md         proposed web UI (not implemented; Phase 1 shipped)
 docs/PLAN-RATE-LIMITER.md how the shared rate limiter works, and why
 docs/images/*.svg         hand-authored setup diagrams
-tests/test_audit.py       126 offline tests, no API access needed
+tests/test_audit.py       127 offline tests, no API access needed
 tests/fixtures/           synthetic headers, example.com domains only
 tests/check_diagrams.py   geometric checks on the SVGs
 ```

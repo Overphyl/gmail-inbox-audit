@@ -204,6 +204,23 @@ def test_the_suite_uses_absolute_paths_for_its_own_files():
         assert os.path.exists(p), p
 
 
+def test_the_documented_test_count_is_the_real_one():
+    """CLAUDE.md and TODO.md both quote how many tests there are, and that
+    number was hand-updated ten times in a single day. A status file nobody
+    can trust is worse than none, so the count checks itself: add a test and
+    this one fails until the docs say so. It is the cheapest possible version
+    of the rule TODO.md states - change the state, update the file."""
+    here = os.path.dirname(SOURCE)
+    n = len([k for k in globals() if k.startswith("test_")])
+    for name in ("CLAUDE.md", "TODO.md"):
+        text = open(os.path.join(here, name), encoding="utf-8").read()
+        found = set(int(m) for m in re.findall(r"(\d+) offline tests", text))
+        assert found, "{} should quote the test count".format(name)
+        assert found == {n}, (
+            "{} says {} offline tests, there are {}".format(
+                name, sorted(found), n))
+
+
 def test_every_text_file_names_its_encoding():
     """Windows defaults to cp1252, and this tool's files are full of non-ASCII:
     sender display names, subjects, the manifest written with
