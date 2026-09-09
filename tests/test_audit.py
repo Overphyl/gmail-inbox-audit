@@ -1052,6 +1052,164 @@ def test_the_pacing_note_says_messages_per_minute():
     assert "5.0/s" in note, note
 
 
+# --------------------------------------------- transient retries, measured
+PRECONDITION = ("Using keyring backend: keyring" + chr(10) +
+                "error[api]: Precondition check failed.")
+
+
+class _TransientTransport(_FakeTransport):
+    """Fails `once` per message with a retryable TRANSIENT, then succeeds."""
+
+    def __init__(self, ids, error=PRECONDITION):
+        _FakeTransport.__init__(self, ids)
+        self.err = error
+        self.seen = set()
+
+    def __call__(self, cmd):
+        argv = list(cmd)
+        if "get" in argv:
+            mid = json.loads(argv[argv.index("--params") + 1])["id"]
+            if mid not in self.seen:
+                self.seen.add(mid)
+                return _Proc(1, "", self.err)
+        return _FakeTransport.__call__(self, cmd)
+
+
+def _run_fetch_transient(a, transport):
+    """cmd_fetch with a real limiter and a captured local sleep.
+
+    _sleep is the seam the TRANSIENT branch backs off through; replacing it
+    keeps the suite fast and lets the test compare what was RECORDED against
+    what was actually asked for.
+    """
+    orig_run, orig_limiter, orig_progress = g._run, g.LIMITER, g.PROGRESS
+    orig_sleep = g._sleep
+    slept = []
+    err = io.StringIO()
+    try:
+        g.PROGRESS = None
+        g._run = transport
+        g._sleep = lambda n: slept.append(n)
+        # A fake clock needs its matching sleeper. acquire() sleeps until a
+        # deadline and re-reads the clock, so a frozen clock plus a real
+        # time.sleep spins forever - which is what this line did first.
+        clock = _Clock(0.0)
+        g.LIMITER = g.RateLimiter(budget=1e9, clock=clock,
+                                  sleeper=clock.sleeper)
+        with contextlib.redirect_stderr(err):
+            g.cmd_fetch(a)
+        return err.getvalue(), g.LIMITER, slept
+    finally:
+        g._run, g.LIMITER, g.PROGRESS = orig_run, orig_limiter, orig_progress
+        g._sleep = orig_sleep
+
+
+def test_transient_retries_and_their_backoff_reach_the_status_file():
+    """A throttle re-queues; a TRANSIENT sleeps locally, and that sleep was
+    invisible in every counter the tool published. A 557-message restore ran
+    76% slower than a 1,108-message one with half the workers, drew zero
+    throttles and dropped nothing, and no file on disk could say where the
+    wall clock went."""
+    ids = ["MSGA", "MSGB", "MSGC", "MSGD"]
+    with tempfile.TemporaryDirectory() as d:
+        a = _fetch_args(d, ids, concurrency=1,
+                        status=os.path.join(d, "fetch-status.json"))
+        out, lim, slept = _run_fetch_transient(a, _TransientTransport(ids))
+
+        assert len(g.load_cache(a.cache)) == 4, "each retry must succeed"
+        st = g.read_status(a.status)["limiter"]
+        assert st["server_errors"] == 4, st
+        assert st["transient_kinds"] == {"get": 4}, st
+        # The time, not just the count: six retries with a doubling delay can
+        # cost minutes while every other number reads clean.
+        assert abs(st["backoff_seconds"] - sum(slept)) < 1e-6, (
+            st["backoff_seconds"], slept)
+        assert st["backoff_seconds"] > 0
+        samples = st["transient_samples"]
+        assert len(samples) == 4 and all(
+            "Precondition check failed" in x["text"] for x in samples), samples
+        assert "Precondition check failed" in out, out
+        assert st["throttles"] == 0, "a transient is not a throttle"
+        assert g.read_status(a.status)["dropped"] == 0
+
+
+def test_a_transient_is_counted_separately_from_a_throttle():
+    """Re-merging them is the pathology CLAUDE.md warns about, and now the
+    two have separate counters, separate kinds and separate samples. A run
+    that is slow because it is asleep and a run that is slow because it is
+    over quota look identical without this."""
+    clock = _Clock(0.0)
+    lim = g.RateLimiter(budget=6000.0, clock=clock)
+    lim.on_throttle("quota exceeded", "get")
+    lim.on_server_error("backend error", "modify")
+    lim.on_server_error("precondition check failed", "modify")
+    st = lim.stats()
+    assert st["throttles"] == 1 and st["throttle_kinds"] == {"get": 1}, st
+    assert st["server_errors"] == 2, st
+    assert st["transient_kinds"] == {"modify": 2}, st
+    assert len(st["transient_samples"]) == 2, st
+    # A transient must not move the rate. That is the whole THROTTLE/TRANSIENT
+    # split and it is unchanged by any of this.
+    assert st["rate"] == 6000.0 / 60.0, st
+
+
+def test_the_mutation_paths_report_their_pacing_too():
+    """This instrumentation exists because of a RESTORE, and cmd_trash and
+    cmd_untrash were the two commands that never reported pacing at all. A
+    diagnostic absent from the path that raised the question is decoration."""
+    src = open(SOURCE, encoding="utf-8").read()
+    tree = ast.parse(src)
+    reporting = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for call in ast.walk(node):
+            if (isinstance(call, ast.Call)
+                    and getattr(call.func, "id", "") == "_report_pacing"):
+                reporting.add(node.name)
+    for cmd in ("cmd_fetch", "cmd_engaged", "cmd_trash", "cmd_untrash"):
+        assert cmd in reporting, "{} does not report pacing".format(cmd)
+
+
+def test_a_run_completes_when_the_transient_capture_raises():
+    """Telemetry, exactly like the throttle sample beside it: a failure that
+    cannot be written down must still be retried and the run must still
+    finish."""
+    ids = ["MSGA", "MSGB"]
+    orig_redact = g.redact
+
+    def boom(text):
+        raise RuntimeError("capture is broken")
+
+    with tempfile.TemporaryDirectory() as d:
+        a = _fetch_args(d, ids, concurrency=1,
+                        status=os.path.join(d, "fetch-status.json"))
+        try:
+            g.redact = boom
+            out, lim, slept = _run_fetch_transient(a, _TransientTransport(ids))
+        finally:
+            g.redact = orig_redact
+        assert len(g.load_cache(a.cache)) == 2, "the scan must still finish"
+        st = lim.stats()
+        # Counting and timing do not go through the redactor, so losing the
+        # text must not lose the measurement.
+        assert st["server_errors"] == 2, st
+        assert st["backoff_seconds"] == sum(slept) > 0, st
+        assert st["transient_samples"] == [], st
+
+
+def test_the_live_line_says_when_a_run_is_asleep():
+    """A run that has gone quiet is exactly when a person wants to know it is
+    sleeping off a retry rather than wedged."""
+    lim = g.RateLimiter(budget=6000.0, clock=_Clock(0.0))
+    progress = g.FetchProgress(100)
+    assert "err" not in g._progress_line(progress, lim)
+    lim.on_server_error("backend error", "get")
+    lim.note_backoff(12.0)
+    line = g._progress_line(progress, lim)
+    assert "err 1" in line and "12s asleep" in line, line
+
+
 # ---------------------------------------------------------------- sharing
 def test_limiter_state_survives_executor_recreation():
     """cmd_fetch builds a new ThreadPoolExecutor per 1000-message batch.

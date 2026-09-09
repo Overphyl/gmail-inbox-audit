@@ -286,6 +286,14 @@ class RateLimiter:
         self._throttle_kinds = collections.Counter()
         self._throttle_samples = []
         self._server_errors = 0
+        # The same treatment for the OTHER retryable class. A throttle costs
+        # the fleet a re-queue; a TRANSIENT costs it a local exponential
+        # sleep, which is invisible in every counter the tool publishes - a
+        # 557-message restore ran 76% slower than a 1,108-message one with
+        # half the workers, and nothing on disk could say why.
+        self._transient_kinds = collections.Counter()
+        self._transient_samples = []
+        self._backoff_seconds = 0.0
         self._errors = 0
         self._grants = 0
         self._waits = 0
@@ -418,10 +426,38 @@ class RateLimiter:
             self._hold_until = now + THROTTLE_HOLD
             self._waited_since_probe = False
 
-    def on_server_error(self):
-        """A 5xx. This request failed; the rate is not implicated."""
+    def on_server_error(self, stderr="", kind=""):
+        """A 5xx or a lost race. This request failed; the rate is not
+        implicated, so nothing here touches pacing - it only records.
+
+        Sampled exactly like a throttle and for exactly the same reason: a
+        count says how many, and the question is always which.
+        "Precondition check failed" and "backend error" are one number here
+        and two different problems.
+        """
         with self._lock:
             self._server_errors += 1
+            self._transient_kinds[kind or "?"] += 1
+            if len(self._transient_samples) < THROTTLE_SAMPLES:
+                try:
+                    self._transient_samples.append({
+                        "kind": kind or "?",
+                        "at": round(self._clock() - self._started, 1),
+                        "text": redact(stderr)[:THROTTLE_TEXT_MAX],
+                    })
+                except Exception:
+                    # Telemetry, like the throttle sample above it.
+                    pass
+
+    def note_backoff(self, seconds):
+        """Record a local sleep a worker is about to take.
+
+        This is the number that answers "where did the wall clock go". The
+        retry budget is six with a doubling delay, so a handful of races can
+        cost minutes while every other counter reads clean.
+        """
+        with self._lock:
+            self._backoff_seconds += max(0.0, float(seconds))
 
     def on_error(self):
         with self._lock:
@@ -468,6 +504,9 @@ class RateLimiter:
                 "throttle_kinds": dict(self._throttle_kinds),
                 "throttle_samples": list(self._throttle_samples),
                 "server_errors": self._server_errors,
+                "transient_kinds": dict(self._transient_kinds),
+                "transient_samples": list(self._transient_samples),
+                "backoff_seconds": self._backoff_seconds,
                 "errors": self._errors,
                 "grants": self._grants,
                 "waits": self._waits,
@@ -548,10 +587,15 @@ def gws(args, sanitize=None, retries=6, throttle_retries=12, limiter=None):
                 continue
         elif TRANSIENT.search(last):
             if lim is not None:
-                lim.on_server_error()
+                lim.on_server_error(last, kind)
             if transient_left > 0:
                 transient_left -= 1
-                _sleep(delay + random.uniform(0, 1.0))
+                nap = delay + random.uniform(0, 1.0)
+                # Recorded before it is taken, so an interrupted run still
+                # accounts for the time it was in the middle of spending.
+                if lim is not None:
+                    lim.note_backoff(nap)
+                _sleep(nap)
                 delay = min(delay * 2, 60.0)
                 continue
         elif lim is not None:
@@ -891,6 +935,12 @@ def _progress_line(progress, limiter):
     )
     if st and st["throttles"]:
         line += "  thr {}".format(st["throttles"])
+    if st and st["server_errors"]:
+        # Shown live, not only at the end: a run that has gone quiet is
+        # exactly when a person wants to know it is asleep rather than stuck.
+        line += "  err {}".format(st["server_errors"])
+        if st["backoff_seconds"] >= 1.0:
+            line += " ({:.0f}s asleep)".format(st["backoff_seconds"])
     return line
 
 
@@ -1002,6 +1052,11 @@ class StatusWriter:
                 # every two seconds must not grow with the run.
                 "throttle_kinds": st["throttle_kinds"],
                 "throttle_samples": st["throttle_samples"],
+                # Bounded exactly like the throttle fields beside them.
+                "server_errors": st["server_errors"],
+                "transient_kinds": st["transient_kinds"],
+                "transient_samples": st["transient_samples"],
+                "backoff_seconds": st["backoff_seconds"],
             },
         }
         tmp = self.path + ".tmp"
@@ -1041,10 +1096,8 @@ def read_status(path):
     return d
 
 
-def _fmt_throttles(lim):
+def _fmt_kinds(total, kinds):
     """'646 (get 640, list 6)' - the split is the whole point of counting."""
-    kinds = lim.get("throttle_kinds") or {}
-    total = lim.get("throttles") or 0
     if not kinds:
         return "{}".format(total)
     parts = ", ".join(
@@ -1054,24 +1107,40 @@ def _fmt_throttles(lim):
     return "{} ({})".format(total, parts)
 
 
-def _report_throttles(limiter):
+def _fmt_throttles(lim):
+    return _fmt_kinds(lim.get("throttles") or 0, lim.get("throttle_kinds") or {})
+
+
+def _report_pacing(limiter):
     """Close a run by saying what the API actually said, if anything.
 
-    A throttle is data, not a failure: it is retried and the work still gets
-    through, so nothing else in the closing output mentions one. That is
-    precisely why 646 of them in a single run left no evidence behind.
+    Both retryable classes, because both are invisible otherwise: a throttle
+    is retried and the work still gets through, and a TRANSIENT is retried
+    after a local sleep and the work still gets through. Neither appears in
+    any other closing line, which is precisely why 646 throttles in one run
+    left no evidence at all and why a restore that spent minutes asleep
+    reported a clean 0 dropped.
     """
     if limiter is None:
         return
     st = limiter.stats()
-    if not st["throttles"]:
-        return
-    print(file=sys.stderr)
-    print("  throttled {} time(s): {}".format(
-        st["throttles"], _fmt_throttles(st)), file=sys.stderr)
-    for sample in st["throttle_samples"]:
-        print("    @{}s {}: {}".format(
-            sample["at"], sample["kind"], sample["text"]), file=sys.stderr)
+    if st["throttles"]:
+        print(file=sys.stderr)
+        print("  throttled {} time(s): {}".format(
+            st["throttles"], _fmt_throttles(st)), file=sys.stderr)
+        for sample in st["throttle_samples"]:
+            print("    @{}s {}: {}".format(
+                sample["at"], sample["kind"], sample["text"]), file=sys.stderr)
+    if st["server_errors"]:
+        print(file=sys.stderr)
+        print("  retried {} transient failure(s): {}{}".format(
+            st["server_errors"],
+            _fmt_kinds(st["server_errors"], st["transient_kinds"]),
+            ", {:.0f}s spent in backoff".format(st["backoff_seconds"])
+            if st["backoff_seconds"] else ""), file=sys.stderr)
+        for sample in st["transient_samples"]:
+            print("    @{}s {}: {}".format(
+                sample["at"], sample["kind"], sample["text"]), file=sys.stderr)
 
 
 def _fmt_ago(seconds):
@@ -1099,6 +1168,11 @@ def _status_lines(d):
         bits.append("limit {:.1f}/s {}".format(lim["rate"], lim["state"]))
     if lim.get("throttles"):
         bits.append("thr " + _fmt_throttles(lim))
+    if lim.get("server_errors"):
+        bits.append("err " + _fmt_kinds(lim["server_errors"],
+                                        lim.get("transient_kinds") or {}))
+    if lim.get("backoff_seconds"):
+        bits.append("backoff {:.0f}s".format(lim["backoff_seconds"]))
     if d.get("query"):
         bits.append("query {}".format(d["query"]))
     bits.append("updated " + _fmt_ago(d["age"]))
@@ -1110,6 +1184,9 @@ def _status_lines(d):
     # the API actually sent back is worth two lines of terminal.
     for sample in (lim.get("throttle_samples") or [])[:1]:
         lines.append("         throttle @{}s ({}): {}".format(
+            sample.get("at"), sample.get("kind"), sample.get("text", "")))
+    for sample in (lim.get("transient_samples") or [])[:1]:
+        lines.append("         transient @{}s ({}): {}".format(
             sample.get("at"), sample.get("kind"), sample.get("text", "")))
     if d["stale"]:
         lines.append(
@@ -1316,7 +1393,7 @@ def cmd_fetch(a):
         ),
         file=sys.stderr,
     )
-    _report_throttles(LIMITER)
+    _report_pacing(LIMITER)
     _report_drops(progress, len(todo), "fetch")
     if interrupted:
         sys.exit("\ninterrupted - {:,} fetched; re-run to resume.".format(progress.done))
@@ -1412,7 +1489,7 @@ def cmd_engaged(a):
         if out is not None:
             out.close()
         status.write(progress, LIMITER, _final_state(progress, interrupted))
-    _report_throttles(LIMITER)
+    _report_pacing(LIMITER)
     _report_drops(progress, len(todo), "engaged")
 
     # Neither an interrupted nor an aborted run writes engaged.txt, and that
@@ -2246,6 +2323,7 @@ def cmd_trash(a):
                      state=_final_state(progress, interrupted))
 
     print("To undo: python gmail_audit.py untrash --manifest {}".format(manifest))
+    _report_pacing(LIMITER)
     _report_mutations(
         "Done. {} messages moved to Trash (recoverable for 30 days).",
         progress.done, progress.dropped,
@@ -2345,6 +2423,7 @@ def cmd_untrash(a):
         reporter.join(timeout=5.0)
         status.write(progress, LIMITER,
                      state=_final_state(progress, interrupted))
+    _report_pacing(LIMITER)
     _report_mutations(
         # "from Trash", not "to the inbox": untrash removes the TRASH label,
         # and where a message then appears depends on the labels it still

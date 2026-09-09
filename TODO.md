@@ -15,7 +15,7 @@ Last updated: 2026-09-09.
 ## Start here
 
 ```bash
-python tests/test_audit.py     # 140 offline tests, no Gmail access, no quota
+python tests/test_audit.py     # 145 offline tests, no Gmail access, no quota
 python tests/check_diagrams.py
 ```
 
