@@ -719,6 +719,169 @@ def test_no_rate_limit_falls_back_to_local_backoff_on_a_throttle():
     assert len(slept) == 1 and slept[0] > 0, slept
 
 
+# ------------------------------------------------------- throttle capture
+QUOTA_ERROR = (
+    "Using keyring backend: keyring\n"
+    "error[api]: Quota exceeded for quota metric 'Total Query Cost' and "
+    "limit 'Units per minute per user' of service 'gmail.googleapis.com' "
+    "for consumer 'project_number:000000000000'."
+)
+
+
+class _ThrottlingTransport(_FakeTransport):
+    """A _FakeTransport that draws a 429 before answering.
+
+    throttle_gets messages are throttled once each; throttle_list throttles
+    the listing call that many times before it succeeds. Both retry and
+    succeed, which is exactly why their text never reached any file: the two
+    throttles ever read on a real mailbox arrived only because a message
+    exhausted all twelve retries and became a drop.
+    """
+
+    def __init__(self, ids, throttle_gets=(), throttle_list=0,
+                 error=QUOTA_ERROR):
+        _FakeTransport.__init__(self, ids)
+        self.quota = error
+        self.pending = collections.Counter(throttle_gets)
+        self.list_left = throttle_list
+
+    def __call__(self, cmd):
+        argv = list(cmd)
+        if "list" in argv and self.list_left > 0:
+            self.list_left -= 1
+            self.calls["list-throttled"] += 1
+            return _Proc(1, "", self.quota)
+        if "get" in argv:
+            mid = json.loads(argv[argv.index("--params") + 1])["id"]
+            if self.pending[mid] > 0:
+                self.pending[mid] -= 1
+                self.calls["get-throttled"] += 1
+                return _Proc(1, "", self.quota)
+        return _FakeTransport.__call__(self, cmd)
+
+
+def _run_fetch_throttled(a, transport, rate=1000.0):
+    """cmd_fetch with a REAL limiter, over a virtual clock.
+
+    A real clock would make this test sleep for THROTTLE_PAUSE per throttle;
+    the rate is high enough that pacing never binds, so only the pause is
+    virtual. Concurrency 1 keeps the shared clock deterministic.
+    """
+    orig_run, orig_limiter, orig_progress = g._run, g.LIMITER, g.PROGRESS
+    # A stale handle from an earlier test points at a tempdir that no
+    # longer exists; record_throttle is guarded, but it should not be the
+    # thing under test here.
+    g.PROGRESS = None
+    clock = _Clock(0.0)
+    err = io.StringIO()
+    try:
+        g._run = transport
+        g.LIMITER = g.RateLimiter(rate=rate, max_rate=rate, adaptive=False,
+                                  clock=clock, sleeper=clock.sleeper)
+        with contextlib.redirect_stderr(err):
+            g.cmd_fetch(a)
+        return err.getvalue(), g.LIMITER
+    finally:
+        g._run, g.LIMITER, g.PROGRESS = orig_run, orig_limiter, orig_progress
+
+
+def test_throttle_text_reaches_the_status_file_and_is_capped():
+    """Every claim about WHY this tool gets throttled has been inference from
+    a counter. gws() holds the API's own sentence when it classifies a
+    THROTTLE and used to drop it on the floor; one pinned run drew 646 of
+    them and left no text behind at all.
+
+    Capped, because the status file is rewritten every two seconds and read
+    by another process: telemetry that grows with the run is a different bug.
+    """
+    ids = ["MSGA", "MSGB", "MSGC", "MSGD", "MSGE", "MSGF", "MSGG", "MSGH"]
+    with tempfile.TemporaryDirectory() as d:
+        a = _fetch_args(d, ids, concurrency=1,
+                        status=os.path.join(d, "fetch-status.json"))
+        out, lim = _run_fetch_throttled(
+            a, _ThrottlingTransport(ids, throttle_gets=ids))
+
+        assert len(g.load_cache(a.cache)) == 8, "every throttle retried clean"
+        st = g.read_status(a.status)
+        samples = st["limiter"]["throttle_samples"]
+        assert st["limiter"]["throttles"] == 8, st["limiter"]
+        assert len(samples) == g.THROTTLE_SAMPLES == 5, samples
+        assert all("Units per minute per user" in s["text"] for s in samples)
+        assert all(len(s["text"]) <= g.THROTTLE_TEXT_MAX for s in samples)
+        # Not just present - readable, and at the end of the run rather than
+        # only in a file nobody thinks to open.
+        assert "Units per minute per user" in out, out
+        # ...and the drop file has it too, without any message being dropped.
+        rows = [json.loads(l) for l in open(a.dropped, encoding="utf-8")
+                if l.strip()]
+        assert len(rows) == g.THROTTLE_SAMPLES, rows
+        assert all(r["event"] == "throttle" for r in rows), rows
+        assert st["dropped"] == 0, "a throttle is not a drop"
+
+
+def test_captured_throttle_text_names_no_mailbox_data():
+    """The capture exists to be pasted - into a bug report, into
+    docs/PLAN-RATE-LIMITER.md. A throttle stderr can echo the request that
+    drew it, and that request carries a message ID and a query naming a
+    sender, so redaction happens at the write and not at every read."""
+    raw = ('error[api]: 429 on request {"id":"18f4429ab0cdef12",'
+           '"q":"from:bob.smith@example.com"}')
+    clean = g.redact(raw)
+    assert "18f4429ab0cdef12" not in clean and "<id>" in clean, clean
+    assert "@" not in clean and "<addr>" in clean, clean
+    assert "429" in clean, "the diagnosis itself must survive"
+
+
+def test_listing_and_per_message_throttles_are_counted_separately():
+    """They were one counter, so a throttle drawn by list_ids' pagination
+    read exactly like one drawn by a per-message fetch - and those are
+    different answers to why a scan throttles at all. list_ids makes ONE gws
+    call for the whole mailbox (--page-all), so the split is also the only
+    way to see the listing burst in the numbers."""
+    ids = ["MSGA", "MSGB", "MSGC", "MSGD"]
+    with tempfile.TemporaryDirectory() as d:
+        a = _fetch_args(d, ids, concurrency=1,
+                        status=os.path.join(d, "fetch-status.json"))
+        out, lim = _run_fetch_throttled(
+            a, _ThrottlingTransport(ids, throttle_gets=["MSGB", "MSGC"],
+                                    throttle_list=2))
+        kinds = lim.stats()["throttle_kinds"]
+        assert kinds == {"list": 2, "get": 2}, kinds
+        assert len(g.load_cache(a.cache)) == 4, "both kinds retried clean"
+        assert "list 2" in out and "get 2" in out, out
+
+
+def test_a_scan_completes_when_the_throttle_capture_raises():
+    """Telemetry, exactly like the status file: a throttle that cannot be
+    written down must still pause the fleet and still let the scan finish.
+    Recording a throttle is the one thing on this path that runs while the
+    API is already unhappy, so it is the worst possible place to raise."""
+    ids = ["MSGA", "MSGB", "MSGC"]
+    orig_redact = g.redact
+
+    def boom(text):
+        raise RuntimeError("capture is broken")
+
+    with tempfile.TemporaryDirectory() as d:
+        a = _fetch_args(d, ids, concurrency=1,
+                        status=os.path.join(d, "fetch-status.json"))
+        try:
+            g.redact = boom
+            out, lim = _run_fetch_throttled(
+                a, _ThrottlingTransport(ids, throttle_gets=ids,
+                                        throttle_list=1))
+        finally:
+            g.redact = orig_redact
+        assert len(g.load_cache(a.cache)) == 3, "the scan must still finish"
+        # The counters do not go through the redactor, so the count survives
+        # even when the text does not. Losing the sentence is a diagnosis
+        # problem; losing the run is a mailbox problem.
+        st = lim.stats()
+        assert st["throttles"] == 4, st
+        assert st["throttle_kinds"] == {"list": 1, "get": 3}, st
+        assert st["throttle_samples"] == [], st
+
+
 # ---------------------------------------------------------------- sharing
 def test_limiter_state_survives_executor_recreation():
     """cmd_fetch builds a new ThreadPoolExecutor per 1000-message batch.

@@ -258,6 +258,45 @@ the parsed tree for any `kill` call, so a comment may name it but code may not.
 wrapped and swallowed, and goes through a temp file plus `os.replace` so a
 reader polling it never sees half a document.
 
+**A throttle is evidence, and it is kept.** `gws()` held the API's own stderr
+when it classified a `THROTTLE` and then discarded it, so 646 throttles in a
+single pinned run left nothing on disk and every claim in
+`docs/PLAN-RATE-LIMITER.md` about *why* the fleet is throttled was inference
+from a counter. The only two texts ever read arrived by accident: a message
+exhausted all twelve throttle retries and became a drop. `_record_throttle()`
+now keeps the first `THROTTLE_SAMPLES` (5) texts per run in the limiter, in
+the status file and in the drop file, tagged `"event": "throttle"` so a person
+reading that file for IDs to retry can still tell the two apart. Capped
+because the status file is rewritten every two seconds: telemetry that grows
+with the run is a different bug.
+
+`_record_throttle()` calls `on_throttle()` **first and unguarded** - that is
+control, the pause and the possible decrease, and a real limiter bug must
+still surface - and only then records, inside a swallow. A throttle that
+cannot be written down still has to pace the fleet.
+`test_a_scan_completes_when_the_throttle_capture_raises` removes the guard's
+excuse by making the capture path itself raise.
+
+**Throttles are counted per API method, and `list` is not `get`.** They were
+one counter, so a throttle drawn by `list_ids` pagination read exactly like
+one drawn by a per-message fetch - and those are different answers to the
+question the counter exists to settle. `_call_kind()` reads the verb straight
+out of the argument list, so nothing is plumbed through the call sites. Note
+what the split can and cannot see: `list_ids` passes `--page-all`, so one
+`gws` call paginates the whole mailbox and a 429 that `gws` retries *inside*
+that call is invisible here. A `list` throttle in the counter is one that
+failed the whole call. Also, `list_ids` runs before `cmd_fetch` builds its
+`FetchProgress`, so listing throttles reach the limiter and the status file
+but not the drop file.
+
+**Captured throttle text is redacted at the capture, not at the read.**
+`redact()` strips addresses and Gmail's lowercase-hex message IDs. This text
+exists to be *pasted* - into a bug report, into
+`docs/PLAN-RATE-LIMITER.md` - and a throttle stderr can echo the request that
+drew it, which carries an ID and sometimes a query naming a sender. Deciding
+once at the write is the same rule the drop file already follows by recording
+IDs and never headers.
+
 **A mutation reports progress like a scan does.** `cmd_trash` and `cmd_untrash`
 build a `FetchProgress`, run through `_mutate()` and publish through
 `StatusWriter`, so the live line, the rate, the ETA and `gmail_audit.py status`
@@ -286,7 +325,7 @@ docs/SETUP.md             OAuth setup, troubleshooting, platform notes
 docs/DESIGN-UI.md         proposed web UI (not implemented; Phase 1 shipped)
 docs/PLAN-RATE-LIMITER.md how the shared rate limiter works, and why
 docs/images/*.svg         hand-authored setup diagrams
-tests/test_audit.py       127 offline tests, no API access needed
+tests/test_audit.py       131 offline tests, no API access needed
 tests/fixtures/           synthetic headers, example.com domains only
 tests/check_diagrams.py   geometric checks on the SVGs
 ```
@@ -311,6 +350,7 @@ tests/check_diagrams.py   geometric checks on the SVGs
 | Guard + coverage + signals, one rendering | `row_notes()` |
 | The review file, both directions | `write_review()`, `parse_review()`, `load_review_approved()` |
 | Cross-process scan status | `StatusWriter`, `read_status()`, `cmd_status()` |
+| Throttle capture, and its redaction | `_record_throttle()`, `_call_kind()`, `redact()`, `_report_throttles()` |
 | Mutation | `_trash_one()`, `_untrash_one()`, `_relabel_one()`, `_mutate()` |
 | Auth preflight and its error classification | `preflight()`, `classify_gws_error()`, `UI_ERRORS`, `UI_HINTS`, `PREFLIGHT_LABELS` |
 | First-run readiness check | `cmd_doctor()` |

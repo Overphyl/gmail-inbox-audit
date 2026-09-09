@@ -113,6 +113,68 @@ def _retryable(stderr):
     return bool(THROTTLE.search(s) or TRANSIENT.search(s))
 
 
+# Diagnosis, not control. Every claim about WHY the fleet gets throttled has
+# been inference from counters: gws() already holds the stderr when it
+# classifies a THROTTLE and then throws it away, so the one artefact that
+# would settle the question has never been kept. Capture a few per run.
+THROTTLE_SAMPLES = 5     # texts kept per run - enough to see whether they
+                         # agree, few enough to bound the status file
+THROTTLE_TEXT_MAX = 300  # characters kept from each, as in the drop file
+
+# Gmail message IDs are lowercase hex. A throttle stderr can echo the request
+# that drew it, which carries an ID and sometimes a query naming a sender.
+_HEXISH = re.compile(r"\b[0-9a-f]{12,}\b")
+
+
+def redact(text):
+    """Strip anything that could name a mailbox out of telemetry text.
+
+    Captured throttle text exists to be *read* - pasted into a bug report or
+    into docs/PLAN-RATE-LIMITER.md - so it is redacted where it is captured
+    rather than where it is used. Same rule as the drop file, which records
+    IDs and never headers: decide once, at the write, not on every read.
+
+    ADDR is defined further down; module globals resolve at call time.
+    """
+    return _HEXISH.sub("<id>", ADDR.sub("<addr>", str(text or "")))
+
+
+def _call_kind(args):
+    """Which API method a gws argument list invokes: 'list', 'get', 'modify'.
+
+    Throttles were a single counter, so one drawn by list_ids' pagination was
+    indistinguishable from one drawn by a per-message fetch - and those are
+    different hypotheses about why a scan throttles at all. The verb is
+    already the last word before the first flag; nothing needs plumbing
+    through the call sites.
+    """
+    verb = ""
+    for tok in args:
+        if str(tok).startswith("-"):
+            break
+        verb = str(tok)
+    return verb or "?"
+
+
+def _record_throttle(limiter, kind, stderr):
+    """Pace the fleet, then write the throttle down.
+
+    Order is the point. on_throttle() is control - the pause and the possible
+    decrease - and runs first, unguarded, so a real limiter bug still
+    surfaces. The drop-file half below is telemetry and is swallowed: a
+    throttle that could not be recorded must not end a scan that was
+    otherwise going to succeed.
+    """
+    if limiter is not None:
+        limiter.on_throttle(stderr, kind)
+    try:
+        progress = PROGRESS
+        if progress is not None:
+            progress.record_throttle(kind, stderr)
+    except Exception:
+        pass
+
+
 RATE_DEFAULT = 8.0       # req/s the scan PINS unless --adaptive is passed.
                          # Measured against a real mailbox on 2026-09-08: pinned
                          # here it held 5.17 msg/s where the adaptive controller
@@ -170,7 +232,13 @@ class RateLimiter:
         # overshoot burst the moment latency improves.
         self._waited_since_probe = False
         self._stopped = False
+        self._started = now
         self._throttles = 0
+        # Split by API method, because "the fleet is too fast" and "the
+        # listing burst is too fast" are different diagnoses with the same
+        # counter. Samples are the stderr texts themselves, capped.
+        self._throttle_kinds = collections.Counter()
+        self._throttle_samples = []
         self._server_errors = 0
         self._errors = 0
         self._grants = 0
@@ -241,11 +309,32 @@ class RateLimiter:
     def on_success(self):
         pass
 
-    def on_throttle(self):
-        """The fleet is too fast. Pause everyone, then shrink the rate once."""
+    def on_throttle(self, stderr="", kind=""):
+        """The fleet is too fast. Pause everyone, then shrink the rate once.
+
+        stderr and kind are diagnosis only: they are counted and sampled and
+        they change no decision below. Both default to empty so the many
+        existing callers - and the offline fleet simulation - keep working
+        unchanged.
+        """
         with self._lock:
             now = self._clock()
             self._throttles += 1
+            self._throttle_kinds[kind or "?"] += 1
+            if len(self._throttle_samples) < THROTTLE_SAMPLES:
+                try:
+                    self._throttle_samples.append({
+                        "kind": kind or "?",
+                        # Seconds into the run: whether throttles cluster
+                        # early is the difference between a listing burst
+                        # and a steady-state ceiling.
+                        "at": round(now - self._started, 1),
+                        "text": redact(stderr)[:THROTTLE_TEXT_MAX],
+                    })
+                except Exception:
+                    # Telemetry. A throttle that cannot be written down must
+                    # still pause the fleet - that is what this call is for.
+                    pass
             # This delays only FUTURE acquirers. Workers already holding a
             # deadline proceed, so overshoot is bounded by --concurrency
             # requests. Revoking issued deadlines would need a Condition and
@@ -308,6 +397,8 @@ class RateLimiter:
                 "adaptive": self.adaptive,
                 "state": self._state(self._clock()),
                 "throttles": self._throttles,
+                "throttle_kinds": dict(self._throttle_kinds),
+                "throttle_samples": list(self._throttle_samples),
                 "server_errors": self._server_errors,
                 "errors": self._errors,
                 "grants": self._grants,
@@ -354,6 +445,7 @@ def gws(args, sanitize=None, retries=6, throttle_retries=12, limiter=None):
     if sanitize:
         cmd += ["--sanitize", sanitize]
     lim = LIMITER if limiter is None else limiter
+    kind = _call_kind(args)
     delay = 2.0
     last = ""
     transient_left = retries
@@ -368,8 +460,11 @@ def gws(args, sanitize=None, retries=6, throttle_retries=12, limiter=None):
             return p.stdout
         last = (p.stderr or "").strip()
         if THROTTLE.search(last):
+            # Counted, classified by method and sampled before any retry
+            # decision: a throttle that is retried successfully never reaches
+            # the drop file, which is why 646 of them left no text behind.
+            _record_throttle(lim, kind, last)
             if lim is not None:
-                lim.on_throttle()
                 if throttle_left > 0:
                     throttle_left -= 1
                     continue  # no local sleep; the limiter is the backoff
@@ -531,6 +626,7 @@ class FetchProgress:
     WINDOW = 10.0        # seconds of history behind the instantaneous rate
     MAX_DROP_LINES = 20  # per-message failure lines before suppression
     ABORT_AFTER = 25     # consecutive non-retryable failures
+    MAX_THROTTLE_LINES = THROTTLE_SAMPLES  # throttle texts written to disk
 
     def __init__(self, total, drop_path=None):
         self.total = int(total)
@@ -543,6 +639,7 @@ class FetchProgress:
         self._lock = threading.Lock()
         self._drop_file = None
         self._drop_lines = 0
+        self._throttle_lines = 0
         self._consecutive = 0
 
     # ------------------------------------------------------------ counters
@@ -609,6 +706,48 @@ class FetchProgress:
                     )
             else:
                 self._consecutive = 0
+
+    def record_throttle(self, kind, error):
+        """Write down a throttle. It is NOT a drop and never counts as one.
+
+        A throttle is retried until it succeeds, so its text reached no file
+        at all: the only two ever read arrived because a message exhausted
+        all twelve retries and became a drop. The file already exists, holds
+        exactly this class of data and is gitignored, so a handful of
+        "event": "throttle" records go here rather than into a new one. Drop
+        records keep the shape they have always had - no "event" key means a
+        drop - because that file is read by a person looking for IDs to
+        retry.
+
+        Wrapped and swallowed, like the status file: telemetry must never
+        fail a scan.
+        """
+        try:
+            text = redact(error).replace("\n", " ")[:THROTTLE_TEXT_MAX]
+            with self._lock:
+                if not self.drop_path:
+                    return
+                if self._throttle_lines >= self.MAX_THROTTLE_LINES:
+                    return
+                self._throttle_lines += 1
+                if self._drop_file is None:
+                    self._drop_file = open(self.drop_path, "a", encoding="utf-8")
+                self._drop_file.write(
+                    json.dumps(
+                        {
+                            "event": "throttle",
+                            "kind": kind or "?",
+                            "ts": datetime.datetime.now().isoformat(
+                                timespec="seconds"),
+                            "error": text,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+                self._drop_file.flush()
+        except Exception:
+            pass
 
     def abort(self, reason):
         with self._lock:
@@ -778,6 +917,11 @@ class StatusWriter:
             "limiter": None if st is None else {
                 "rate": st["rate"], "state": st["state"],
                 "throttles": st["throttles"],
+                # Both bounded: kinds has one key per API method, samples is
+                # capped at THROTTLE_SAMPLES. A status file a reader polls
+                # every two seconds must not grow with the run.
+                "throttle_kinds": st["throttle_kinds"],
+                "throttle_samples": st["throttle_samples"],
             },
         }
         tmp = self.path + ".tmp"
@@ -817,6 +961,39 @@ def read_status(path):
     return d
 
 
+def _fmt_throttles(lim):
+    """'646 (get 640, list 6)' - the split is the whole point of counting."""
+    kinds = lim.get("throttle_kinds") or {}
+    total = lim.get("throttles") or 0
+    if not kinds:
+        return "{}".format(total)
+    parts = ", ".join(
+        "{} {}".format(k, n)
+        for k, n in sorted(kinds.items(), key=lambda kv: (-kv[1], kv[0]))
+    )
+    return "{} ({})".format(total, parts)
+
+
+def _report_throttles(limiter):
+    """Close a run by saying what the API actually said, if anything.
+
+    A throttle is data, not a failure: it is retried and the work still gets
+    through, so nothing else in the closing output mentions one. That is
+    precisely why 646 of them in a single run left no evidence behind.
+    """
+    if limiter is None:
+        return
+    st = limiter.stats()
+    if not st["throttles"]:
+        return
+    print(file=sys.stderr)
+    print("  throttled {} time(s): {}".format(
+        st["throttles"], _fmt_throttles(st)), file=sys.stderr)
+    for sample in st["throttle_samples"]:
+        print("    @{}s {}: {}".format(
+            sample["at"], sample["kind"], sample["text"]), file=sys.stderr)
+
+
 def _fmt_ago(seconds):
     return "just now" if seconds < 1.5 else _fmt_eta(seconds) + " ago"
 
@@ -834,16 +1011,24 @@ def _status_lines(d):
         d.get("command", "?"), state, "{:,}".format(done), "{:,}".format(total),
         pct, rate, _fmt_eta(eta), d.get("dropped") or 0,
     )
-    lim = d.get("limiter")
+    lim = d.get("limiter") or {}
     bits = []
     if lim:
         bits.append("limit {:.1f}/s {}".format(lim["rate"], lim["state"]))
+    if lim.get("throttles"):
+        bits.append("thr " + _fmt_throttles(lim))
     if d.get("query"):
         bits.append("query {}".format(d["query"]))
     bits.append("updated " + _fmt_ago(d["age"]))
     bits.append("pid {}".format(d.get("pid", "?")))
     tail = "         " + " · ".join(bits)
     lines = [head, tail]
+    # The first captured throttle text. Every claim about why this tool gets
+    # throttled was inference from the count on the line above; the sentence
+    # the API actually sent back is worth two lines of terminal.
+    for sample in (lim.get("throttle_samples") or [])[:1]:
+        lines.append("         throttle @{}s ({}): {}".format(
+            sample.get("at"), sample.get("kind"), sample.get("text", "")))
     if d["stale"]:
         lines.append(
             "         the process is gone. Re-run {} to resume; the cache "
@@ -1040,6 +1225,7 @@ def cmd_fetch(a):
         ),
         file=sys.stderr,
     )
+    _report_throttles(LIMITER)
     _report_drops(progress, len(todo), "fetch")
     if interrupted:
         sys.exit("\ninterrupted - {:,} fetched; re-run to resume.".format(progress.done))
@@ -1093,6 +1279,14 @@ def cmd_engaged(a):
     # failure, not partial. A dropped ID is never checkpointed, so re-running
     # retries it.
     progress = FetchProgress(len(todo), drop_path=getattr(a, "dropped", "") or None)
+    # Published for the same reason cmd_fetch publishes it:
+    # _record_throttle reaches the drop file through this handle, and an
+    # engaged scan draws throttles exactly like a fetch does. Without this
+    # line the capture would silently cover one of the two scans - the
+    # failure mode CLAUDE.md warns about when it says a test that only
+    # passes because the fixture lacks the case is worse than none.
+    global PROGRESS
+    PROGRESS = progress
     a.progress = progress
     status = StatusWriter(getattr(a, "status", "") or None, "engaged",
                           query="in:sent", cache=cache_path or a.out)
@@ -1127,6 +1321,7 @@ def cmd_engaged(a):
         if out is not None:
             out.close()
         status.write(progress, LIMITER, _final_state(progress, interrupted))
+    _report_throttles(LIMITER)
     _report_drops(progress, len(todo), "engaged")
 
     # Neither an interrupted nor an aborted run writes engaged.txt, and that
