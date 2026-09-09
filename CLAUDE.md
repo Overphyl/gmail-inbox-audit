@@ -41,6 +41,25 @@ label cannot delete anything, which is why the purpose survives the amendment.
 `removeLabelIds` in the source. Removing a label is still a thing this tool
 does not do.
 
+Only `INBOX` is restored (`RESTORE_LABELS`). On the measured round trip
+`CATEGORY_*` and `IMPORTANT` survived trash and untrash untouched, so re-adding
+them is a no-op; re-adding `UNREAD` would be worse than a no-op, resurrecting a
+read state from whenever the cache was built rather than from just before the
+trash. The manifest records every label anyway, so if another turns out to be
+lost the evidence is on disk and that tuple is the one edit.
+
+Untrash and relabel are **one unit of work**, not two passes: a message that
+left Trash but never got its `INBOX` back is half restored, and counting it as
+a success would be the same lie as counting attempts.
+
+**`--params` and `--json` are different channels.** `--params` carries path and
+query parameters; the request body goes in `--json`. Passing `addLabelIds`
+through `--params` does not fail loudly - `gws` warns that the parameter is not
+marked as repeated and stringifies it, so the API receives a single label
+literally named `["INBOX"]` and answers `Invalid label`. `metadataHeaders` in
+`get_headers` is an array through `--params` and works, because it is a query
+parameter; that similarity is the trap.
+
 **`Subject` never influences classification.** It is a header, but it is
 attacker-controlled free text — the sender chooses it. It is collected for
 clustering and the audit trail only. `test_subject_never_contributes_to_score`
@@ -250,7 +269,7 @@ docs/SETUP.md             OAuth setup, troubleshooting, platform notes
 docs/DESIGN-UI.md         proposed web UI (not implemented; Phase 1 shipped)
 docs/PLAN-RATE-LIMITER.md how the shared rate limiter works, and why
 docs/images/*.svg         hand-authored setup diagrams
-tests/test_audit.py       117 offline tests, no API access needed
+tests/test_audit.py       122 offline tests, no API access needed
 tests/fixtures/           synthetic headers, example.com domains only
 tests/check_diagrams.py   geometric checks on the SVGs
 ```
@@ -275,7 +294,7 @@ tests/check_diagrams.py   geometric checks on the SVGs
 | Guard + coverage + signals, one rendering | `row_notes()` |
 | The review file, both directions | `write_review()`, `parse_review()`, `load_review_approved()` |
 | Cross-process scan status | `StatusWriter`, `read_status()`, `cmd_status()` |
-| Mutation | `_trash_one()`, `_mutate()`, `cmd_trash()`, `cmd_untrash()` |
+| Mutation | `_trash_one()`, `_untrash_one()`, `_relabel_one()`, `_mutate()` |
 | Auth preflight and its error classification | `preflight()`, `classify_gws_error()`, `UI_ERRORS`, `UI_HINTS`, `PREFLIGHT_LABELS` |
 | First-run readiness check | `cmd_doctor()` |
 | The required replied-to safeguard | `require_engaged()`, `load_engaged()` |

@@ -1271,7 +1271,11 @@ def test_review_header_records_the_important_mode():
     assert "IMPORTANT guard: off" in head, head
 
 
-def _run_mutation(fn, args, fail_ids=(), error="429 rate limit"):
+RELABELS = {}   # msg_id -> labels the stubbed _relabel_one was asked to add
+
+
+def _run_mutation(fn, args, fail_ids=(), error="429 rate limit",
+                  relabel_error=None):
     """Run a mutating command with some message IDs made to fail.
 
     Returns (stdout, exit_message or None). The default error is a throttle,
@@ -1283,8 +1287,15 @@ def _run_mutation(fn, args, fail_ids=(), error="429 rate limit"):
             raise RuntimeError(error)
         return msg_id
 
-    orig_t, orig_u = g._trash_one, g._untrash_one
+    orig_t, orig_u, orig_r = g._trash_one, g._untrash_one, g._relabel_one
     g._trash_one = g._untrash_one = flaky
+    def relabel(mid, labels, sanitize=None):
+        if relabel_error:
+            raise RuntimeError(relabel_error)
+        RELABELS[mid] = list(labels)
+        return mid
+
+    g._relabel_one = relabel
     out, err = io.StringIO(), io.StringIO()
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -1295,6 +1306,7 @@ def _run_mutation(fn, args, fail_ids=(), error="429 rate limit"):
         return out.getvalue(), None
     finally:
         g._trash_one, g._untrash_one = orig_t, orig_u
+        g._relabel_one = orig_r
 
 
 def _trash_args(d, **kw):
@@ -1336,6 +1348,61 @@ def test_a_clean_trash_run_says_so_and_exits_zero():
     assert exit_msg is None, exit_msg
     assert "{} messages moved to Trash".format(len(msgs)) in out, out[-400:]
     assert "FAILED" not in out
+
+
+def _restore_from(rows, fail_ids=(), relabel_error=None):
+    """Run untrash over a manifest built from `rows`."""
+    RELABELS.clear()
+    with tempfile.TemporaryDirectory() as d, _in(d):
+        manifest = os.path.join(d, "m.jsonl")
+        with open(manifest, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        a = argparse.Namespace(sanitize=None, manifest=manifest, concurrency=1,
+                               execute=True, status="")
+        out, exit_msg = _run_mutation(g.cmd_untrash, a, set(fail_ids),
+                                      relabel_error=relabel_error)
+    return out, exit_msg, dict(RELABELS)
+
+
+def test_a_restore_puts_the_inbox_label_back():
+    """messages.untrash clears TRASH and does not restore INBOX: a real
+    1,108-message restore reported success and landed every message in All
+    Mail. An undo that cannot put things back is not an undo."""
+    rows = [
+        {"id": "A", "labelIds": ["INBOX", "CATEGORY_PROMOTIONS"]},
+        {"id": "B", "labelIds": ["INBOX", "UNREAD", "IMPORTANT"]},
+        {"id": "C", "labelIds": ["CATEGORY_PROMOTIONS"]},   # was archived
+    ]
+    out, exit_msg, relabelled = _restore_from(rows)
+    assert exit_msg is None, exit_msg
+    assert set(relabelled) == {"A", "B"}, relabelled
+    assert relabelled["A"] == ["INBOX"] and relabelled["B"] == ["INBOX"], (
+        "only INBOX is restored: the others survive the round trip, and "
+        "re-adding UNREAD would resurrect a read state from cache time")
+    assert "2 of them will be put back in the inbox" in out, out
+
+
+def test_a_manifest_without_labels_says_where_the_mail_will_land():
+    """Manifests written before label recording cannot say where a message
+    belonged. Saying so is the difference between a known limitation and a
+    person hunting through All Mail wondering what went wrong."""
+    out, exit_msg, relabelled = _restore_from(
+        [{"id": "A", "sender": "x@example.com"}, {"id": "B"}])
+    assert exit_msg is None, exit_msg
+    assert not relabelled, relabelled
+    assert "2 predate label recording" in out, out
+    assert "All Mail" in out and "Move to Inbox" in out, out
+
+
+def test_a_half_restored_message_is_not_a_success():
+    """Untrash then relabel is one unit of work. A message that left Trash but
+    never got its INBOX back is half restored, and counting it as a success
+    would be the same lie as counting attempts."""
+    out, exit_msg, _ = _restore_from([{"id": "A", "labelIds": ["INBOX"]}],
+                                     relabel_error="500 backendError")
+    assert "Restored 0 messages" in out, out
+    assert exit_msg is not None and "1 of 1 messages FAILED" in exit_msg, exit_msg
 
 
 def test_a_failed_untrash_is_not_counted_as_a_success():

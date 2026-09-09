@@ -1712,6 +1712,34 @@ def _trash_one(msg_id, sanitize=None):
     return msg_id
 
 
+# The labels a restore puts back. Only INBOX, deliberately.
+#
+# Measured on a real 1,108-message round trip: CATEGORY_PROMOTIONS,
+# CATEGORY_UPDATES and IMPORTANT all survived trash and untrash untouched, and
+# INBOX was the only casualty. Re-adding the survivors would be a no-op at
+# best; re-adding UNREAD would be worse than a no-op, since it would resurrect
+# a read state from whenever the cache was built rather than from just before
+# the trash. The manifest records every label anyway - if another turns out to
+# be lost, the evidence is already on disk and this tuple is the one edit.
+RESTORE_LABELS = ("INBOX",)
+
+
+def _relabel_one(msg_id, labels, sanitize=None):
+    """Add labels back to a message. Add-only: see the hard rule in CLAUDE.md.
+
+    --params carries path and query parameters; the body goes in --json. They
+    are different channels, and passing addLabelIds through --params gets it
+    stringified into a single label literally named ["INBOX"].
+    """
+    gws(
+        ["gmail", "users", "messages", "modify",
+         "--params", json.dumps({"userId": "me", "id": msg_id}),
+         "--json", json.dumps({"addLabelIds": list(labels)})],
+        sanitize,
+    )
+    return msg_id
+
+
 def _untrash_one(msg_id, sanitize=None):
     params = json.dumps({"userId": "me", "id": msg_id})
     gws(["gmail", "users", "messages", "untrash", "--params", params], sanitize)
@@ -1933,23 +1961,54 @@ def cmd_untrash(a):
             if len(others) > 1 else ""))
     if not os.path.exists(manifest):
         sys.exit("manifest not found: {}".format(manifest))
-    ids = []
+    ids, labels, unlabelled = [], {}, 0
     with open(manifest, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if line:
-                ids.append(json.loads(line)["id"])
+            if not line:
+                continue
+            row = json.loads(line)
+            ids.append(row["id"])
+            if "labelIds" in row:
+                labels[row["id"]] = row["labelIds"]
+            else:
+                unlabelled += 1
     print("Restoring {} messages from {}".format(len(ids), manifest))
+    returning = sum(1 for v in labels.values()
+                    if any(l in RESTORE_LABELS for l in v))
+    if returning:
+        print("  {} of them will be put back in the inbox".format(returning))
+    if unlabelled:
+        # Said plainly rather than left to be discovered in Gmail: untrash
+        # clears TRASH and does not restore INBOX, so without recorded labels
+        # these land in All Mail and there is nothing this command can do
+        # about it.
+        print("  {} predate label recording and will land in All Mail, not "
+              "the inbox.\n  Move them with a Gmail search and 'Move to "
+              "Inbox'.".format(unlabelled))
     if not a.execute:
         print("DRY RUN - re-run with --execute to restore.")
         return
+    def restore(msg_id, sanitize=None):
+        """Untrash, then put back the labels untrash does not.
+
+        One unit of work per message rather than two passes: a message that
+        left Trash but never got its INBOX back is half-restored, and counting
+        it as a success would be the same lie as counting attempts.
+        """
+        _untrash_one(msg_id, sanitize)
+        want = [l for l in (labels.get(msg_id) or []) if l in RESTORE_LABELS]
+        if want:
+            _relabel_one(msg_id, want, sanitize)
+        return msg_id
+
     progress = FetchProgress(len(ids))
     status = StatusWriter(getattr(a, "status", "") or None, "untrash",
                           cache=manifest)
     stop, reporter = _with_reporter(progress, status)
     interrupted = False
     try:
-        _mutate(ids, _untrash_one, a, progress)
+        _mutate(ids, restore, a, progress)
     except KeyboardInterrupt:
         interrupted = True
     finally:

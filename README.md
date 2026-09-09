@@ -306,6 +306,13 @@ With no `--manifest` it takes the most recently written one and prints which,
 so an unintended choice is visible before anything moves. Name an older run
 with `--manifest <path>` to undo that one instead.
 
+**The restore puts messages back in the inbox.** Gmail's `messages.untrash`
+only clears the `TRASH` label; it does not return a message to the inbox, so on
+its own a "restore" leaves everything in All Mail. The manifest records the
+labels each message had, and `untrash` re-adds `INBOX` to the ones that had it.
+Manifests written before this existed cannot say where a message belonged, and
+the command says so rather than leaving you to find out in Gmail.
+
 Both commands print a live progress line with rate and ETA, and publish a
 status file, so `python gmail_audit.py status` reports on a restore running in
 another terminal exactly as it does on a scan.
