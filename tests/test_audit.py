@@ -26,8 +26,15 @@ from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import gmail_audit as g  # noqa: E402
 
-FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "headers.jsonl")
-SOURCE = os.path.join(os.path.dirname(__file__), "..", "gmail_audit.py")
+# abspath, not just join: on Python 3.8 __file__ is RELATIVE when the suite is
+# run as `python tests/test_audit.py`, which is how CI runs it (3.9 made it
+# absolute). Several tests chdir into a temp directory, and a relative fixture
+# path stops resolving the moment they do. Four tests failed on the 3.8 floor
+# job and nowhere else, which is the entire reason that job exists.
+FIXTURE = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "fixtures", "headers.jsonl"))
+SOURCE = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "gmail_audit.py"))
 
 
 def _rows(engaged=(), important=g.IMPORTANT_GUARD_DEFAULT):
@@ -187,6 +194,16 @@ def test_a_safeguard_still_holds_at_the_trash_boundary():
 
 
 # ------------------------------------------------- structural safety checks
+def test_the_suite_uses_absolute_paths_for_its_own_files():
+    """Several tests chdir into a temp directory. On Python 3.8 __file__ is
+    relative when the suite is run as `python tests/test_audit.py`, so a
+    fixture path built from it stops resolving the moment they do. Asserting
+    the property is cheaper than rediscovering it on the floor job."""
+    for p in (FIXTURE, SOURCE):
+        assert os.path.isabs(p), p
+        assert os.path.exists(p), p
+
+
 def test_every_text_file_names_its_encoding():
     """Windows defaults to cp1252, and this tool's files are full of non-ASCII:
     sender display names, subjects, the manifest written with
