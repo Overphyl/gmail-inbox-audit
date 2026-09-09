@@ -41,6 +41,7 @@ only against fixtures.
 | `status` | read a scan from another terminal |
 | `trash --execute` | 1,108 messages, 2 senders, confirmed in Gmail |
 | manifest → `untrash` → `INBOX` restored | 1,107/1,108, confirmed in the inbox |
+| throttle diagnosis, rate and concurrency sweep | 7 runs x 2,000 messages, one at a time |
 
 The one failure was a `Precondition check failed` race, retried by hand and now
 classified `TRANSIENT`.
@@ -67,27 +68,61 @@ safeguard held back. Every batch from here carries labels, so the undo is
 faithful. This is also the first real exercise of `--min-score` and of a
 label-recording manifest.
 
-**2. Measure the rate ceiling above 8 req/s.** `RATE_DEFAULT` is 8.0 because it
-is the only rate ever *observed* stable, not because it was tuned. One
-`fetch --rate 12 --limit 2000` against an existing cache says whether pinning
-higher stays clean or starts drawing throttles faster than it clears requests.
-That number bounds what any correct limiter could achieve, so it is worth more
-than more work on the controller. Record it in `docs/PLAN-RATE-LIMITER.md`.
+**2. ~~Measure the rate ceiling above 8 req/s.~~ Done, 2026-09-09: there is
+nothing up there.** Seven runs of `fetch --limit 2000` over a throwaway cache,
+one at a time, varying one parameter each. Pinning at 12 gives 5.70 msg/s and
+at 16 gives 5.61, against 5.16 at 8 — and all three lose messages to quota. The
+shipped default (`--rate 8 --concurrency 12`) delivers 5.57 msg/s, within 2.3%
+of the fastest configuration measured anywhere. **`RATE_DEFAULT` should not be
+raised**, and the table is in `docs/PLAN-RATE-LIMITER.md`.
 
-**3. Find out why `fetch` throttles at all.** The open puzzle, and item 4
-depends on it. A pinned fetch run reached 5.17 msg/s and drew 646 throttles;
-the 1,108-message restore made calls at the same 5.17/s and drew **zero**. Both
-estimate to ~1,550 units/minute. So steady-state call rate does not explain the
-throttling. The untested suspects are `list_ids` pagination running alongside
-the fetch, and concurrency 12 rather than 8. Cheapest experiment: a fetch at
-concurrency 8 over an already-cached range, and a fetch with listing separated
-from fetching.
+The interesting direction is down. `--rate 5` delivers 5.00 msg/s — 88% of the
+fastest run — for **3 throttles instead of 504, and zero lost messages instead
+of two**. Over a full inbox that is about twenty minutes slower and it is the
+only configuration measured that fetched 2,000 of 2,000. Proposed, not changed:
+it belongs to item 4.
 
-**4. Fix the limiter — only after 3.** The mechanism is documented in
-`docs/PLAN-RATE-LIMITER.md` ("Measured against a real mailbox"). Do not tune
-constants against a mechanism nobody has diagnosed; that is how the current
-constants were arrived at. Items 1-3 of "What to change" there are still open;
-item 4 is done.
+**3. ~~Find out why `fetch` throttles at all.~~ Done, 2026-09-09. All four
+suspects were wrong.** `gws()` now keeps the first five throttle texts per run
+and counts throttles per API method, and the API's own sentence is
+`Quota exceeded ... limit 'Units per minute per user'`.
+
+The constraint is a **per-minute unit budget spent by successful calls**, not a
+rate limit. Across a 3.2x range of pinned rate and a 3x range of concurrency,
+successes clamp to 300-342 per minute while attempts range 300-479: every extra
+request bought a rejection, not a message. Each run runs clean until the budget
+drains — 144s at `--rate 5`, 20s at `--rate 16` — and then oscillates on a
+60-second period as the window rolls over.
+
+- **A second process sharing quota**: disproved. The same configuration
+  reproduced 488 throttles with nothing else touching the account.
+- **`messages.get` costing more than `untrash`/`modify`**: disproved. The fetch
+  sustains 300-342 calls/min; the restore ran at 310, inside that band.
+- **`list_ids` pagination**: disproved. Zero `list` throttles in seven runs,
+  and listing finishes before the first `get` anyway.
+- **Concurrency**: contributes 8% throughput for 79% more throttles, then
+  saturates by 8 workers. Not the cause, and it does not move the ceiling.
+
+The original puzzle was a category error: 5.17 msg/s was the fetch's *achieved*
+rate after being throttled back from an *offered* 8, while the restore was
+latency-bound and only ever *offered* 5.17. It drew no throttles because it sat
+just under a ceiling nobody had measured.
+
+**One number is still unknown and cannot be read from inside this tool.** The
+ceiling is ~307 successful `get`/min, which at the documented 5 units/call is
+1,535 units/min — 10% of Gmail's documented 15,000/min/user. Either this
+project's budget is that small, or one `get` through `gws` costs ~45-50 units
+rather than 5. The Cloud console quota page settles it in one look, and the
+answer bears on the "subprocess per message" decision in `DESIGN-UI.md`.
+
+**4. Fix the limiter — now unblocked, and the target has changed.** Item 3
+delivered the mechanism, so this is no longer gated. Read
+`docs/PLAN-RATE-LIMITER.md`, "the throttle, diagnosed", first: AIMD on
+instantaneous rate is the wrong controller for a per-minute budget, so items
+1-2 of "What to change" prevent the collapse without addressing it. The
+budget looks like a constant, which means the minimal correct controller may
+not be adaptive at all — `--rate 5` already is one. Do not tune constants
+without re-measuring; that is how the current ones were arrived at.
 
 ---
 
@@ -116,6 +151,11 @@ backlog.
   measured round trip untouched. If another turns out to be lost, the manifest
   already records every label and that tuple is the one edit.
 - The adaptive limiter is broken and opt-in behind `--adaptive`.
+- **The mailbox is quota-bound at about 5.5 messages/second and no client-side
+  knob raises it.** Measured seven ways on 2026-09-09; the constraint is a
+  per-minute unit budget, not a rate. A full 35,000-message inbox is therefore
+  a ~2 hour scan at best, and the default pacing spends part of that drawing
+  throttles and losing one to three messages per two thousand.
 - `engaged.txt` on the reference mailbox is 4,763 of 4,764 sent messages: the
   replied-to safeguard is 99.98% complete, not complete.
 - Concurrency above ~16 makes the API drop messages. The `fetch` default is 12
@@ -138,5 +178,12 @@ Recorded because each was paid for once and should not be paid for twice.
   the tool - both were the harness assuming its own environment.
 - **An error matching neither retry pattern gets zero retries, silently.**
   Three such classes turned up in one day.
+- **A counter cannot tell you why.** Four hypotheses about the throttling stood
+  for a day and all four were wrong; the error text settled it in one run, and
+  `gws()` had been holding that text and discarding it the whole time. When a
+  measurement is confusing, check whether the code is already touching the
+  answer.
+- **Compare like with like.** The whole puzzle was one table putting an
+  *achieved* rate next to an *offered* rate in the same column.
 - **"Everything up-to-date" and "N messages moved" can both be lies.** Check
   the number against something the operation could not have faked.

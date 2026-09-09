@@ -572,9 +572,12 @@ a component that request rate does not move.
 
 ### What to change
 
-Item 4 is **done**. The rest is not, and the control law that replaces
-AIMD-on-rate deserves designing rather than guessing: tuning constants against
-a half-understood mechanism is how the current constants were arrived at.
+Items 3 and 4 are **done**, and item 3 is what produced the diagnosis in
+"the throttle, diagnosed" below - read that before acting on 1 or 2, because
+it changes what a correct controller would even be. The control law that
+replaces AIMD-on-rate deserves designing rather than guessing: tuning
+constants against a half-understood mechanism is how the current constants
+were arrived at.
 
 In rough order of confidence:
 
@@ -586,9 +589,14 @@ In rough order of confidence:
    actually falling. After N decreases with no measured improvement, stop
    cutting and say so loudly rather than descending in silence. `FLOOR` should
    be a reported failure, not a resting state.
-3. **Record the throttle text.** Sample the first few throttle stderrs into the
-   status file. Everything above is inference from counters; the actual message
-   would likely end the guessing in one run.
+3. ~~**Record the throttle text.**~~ **Done, and it ended the guessing in one
+   run, exactly as predicted.** `_record_throttle()` samples the first five
+   throttle stderrs per run into the limiter, the status file and the drop
+   file, and counts throttles per API method so a listing throttle is
+   distinguishable from a per-message one. The answer is
+   `Units per minute per user`, the budget is spent by successful calls, and
+   all four standing hypotheses about the cause turned out to be wrong. See
+   the last section of this document.
 4. ~~**Consider making `--rate` the default and adaptive the opt-in.**~~
    **Done.** On the only real evidence that exists, a fixed rate is faster,
    stable, and simpler. That is an uncomfortable conclusion for a document this
@@ -722,3 +730,215 @@ decision was taken on the grounds that subprocess overhead was latency the
 limiter could absorb. If the overhead is *quota* rather than latency, the
 premise was wrong and the decision deserves revisiting on its merits — with the
 credential-handling and `--sanitize` objections still standing, unchanged.
+
+---
+
+## Measured against a real mailbox, 2026-09-09: the throttle, diagnosed
+
+Everything above this point about *why* the fleet gets throttled was inference
+from counters. `gws()` held the API's own stderr at the moment it classified a
+`THROTTLE` and threw it away, so the text quoted under "The throttle, finally
+read" arrived only by accident: a message exhausted all twelve retries and
+became a drop. With `_record_throttle()` keeping the first five texts per run
+and counting them per API method, seven runs against the reference mailbox
+settle the question.
+
+**None of the four suspects is the cause.** The mechanism is a per-minute unit
+budget spent by *successful* calls, and the puzzle that opened the previous
+section - same client, same account, same call rate, opposite results -
+dissolves once you notice that the two rows being compared are an *achieved*
+rate and an *offered* rate, which are not the same measurement.
+
+### How these runs were made
+
+One process at a time, nothing else touching the account (checked against the
+process list before and after), `--limit 2000` every run, over a throwaway
+cache deleted before and after each run so every message really was fetched.
+Every run therefore did identical work on the same 2,000 oldest inbox messages
+and varied exactly one pacing parameter. Ninety seconds idle between runs,
+because the quota is per MINUTE and one run's last minute of spending would
+otherwise land inside the next run's first minute and be charged to it.
+
+Each run also enumerated the whole inbox first - about 35,000 messages, 70
+pages, roughly 35 seconds - because `cmd_fetch` lists before it fetches.
+
+### The runs
+
+| run | rate | conc | throughput | successes/min | attempts/min | throttles | lost | clean for |
+|---|---|---|---|---|---|---|---|---|
+| `r5c4`  | 5  | 4  | 5.00 msg/s | 300 | 300 | **3** | **0** | 144s |
+| `r6c4`  | 6  | 4  | 5.24 msg/s | 314 | 354 | 251 | 1 | 92s |
+| `r8c4`  | 8  | 4  | 5.16 msg/s | 310 | 385 | 488 | 2 | 40s |
+| `r12c4` | 12 | 4  | **5.70 msg/s** | 342 | 428 | 504 | 2 | 22s |
+| `r16c4` | 16 | 4  | 5.61 msg/s | 337 | 427 | 536 | 1 | 20s |
+| `r8c8`  | 8  | 8  | 5.54 msg/s | 332 | 478 | 875 | 3 | 65s |
+| `r8c12` | 8  | 12 | 5.57 msg/s | 334 | 479 | 868 | 3 | 63s |
+
+"lost" is messages the run could not fetch after all twelve throttle retries,
+read off the drop file. Every one failed for quota, not for anything about the
+message. "clean for" is how long the run went before its first throttle.
+
+Read the last four columns together, because that is where the mechanism is.
+**Successes per minute barely move**: 300 to 342, a 14% spread across a 3.2x
+range of pinned rate and a 3x range of concurrency. **Attempts per minute move
+a lot**: 300 to 479. Turning either knob up buys rejected requests, not
+messages.
+
+### What the throttle actually says
+
+Identical in all seven runs and in every one of the 33 sampled texts:
+
+```
+Using keyring backend: keyring
+error[api]: Quota exceeded for quota metric 'Total Query Cost' and limit
+            'Units per minute per user' of service 'gmail.googleapis.com'
+            for consumer 'project_number:<id>'.
+```
+
+`<id>` is `redact()` doing its job. A project number is twelve digits and every
+digit is also a hex digit, so the message-ID pattern claims it. That is the
+right outcome for text meant to be pasted into this document, and it is why no
+consumer number appears here.
+
+### The four hypotheses
+
+**H1 - the throttled runs shared per-user quota with a second process.
+Disproved.** `r8c4` is the same configuration as the run that drew 646
+throttles, run with nothing else touching the account: 5.16 msg/s against the
+recorded 5.17, and 488 throttles against 646. The throttling reproduces solo.
+Contention would of course make it worse, since the budget is per user, but it
+is not needed to explain anything and the original run does not require a
+second process.
+
+**H2 - `messages.get` costs more units than `untrash`/`modify`. Disproved, by
+arithmetic.** If a metadata `get` were the more expensive call, the fetch's
+sustainable rate in calls per minute would have to be *lower* than the
+restore's. It is not. The fetch sustains 300-342 successful calls/min; the
+1,108-message restore ran at 310 calls/min, inside that band. No cost
+asymmetry is needed and none is visible.
+
+**H3 - `list_ids` pagination bursting alongside the per-message fetch.
+Disproved twice over.** The new per-method split counted **zero** `list`
+throttles across seven runs; all 3,000-odd were `get`. And the burst cannot
+overlap the fetch anyway: `cmd_fetch` runs `list_ids` to completion before the
+first `messages.get`, and `list_ids` passes `--page-all`, so the whole 70-page
+enumeration is a single `gws` invocation. It costs about 35 seconds and draws
+nothing.
+
+One caveat the split cannot see, recorded so nobody re-derives it: a 429 that
+`gws` retries *inside* that one paginating call never reaches this code. A
+`list` throttle in the counter is one that failed the whole invocation. What
+the zero does establish is that listing never failed hard, and the timeline
+puts every throttle well after listing ended.
+
+**H4 - concurrency. Contributes, but is not the cause and does not set the
+ceiling.** At a pinned 8 req/s, going from 4 to 8 workers raises throughput
+5.16 to 5.54 msg/s and raises throttles 488 to 875. Going on to 12 workers
+changes neither (5.57 msg/s, 868 throttles). Concurrency buys about 8%
+throughput for 79% more rejected requests and then saturates. The observation
+that the zero-throttle restore had *higher* concurrency than the throttled
+fetch holds up: concurrency is not what separates them.
+
+### The mechanism: a per-minute budget, spent by successes
+
+The API says `Units per minute per user`, and the runs behave like a budget
+rather than a rate limit:
+
+1. **Every run starts clean and then falls off a cliff.** `r8c4` fetched its
+   first 339 messages at 8.58 msg/s with zero throttles and hit the wall 40
+   seconds in; `r16c4` got 293 messages and 20 seconds; `r5c4` got 733
+   messages and 144 seconds. A rate ceiling would have throttled the first
+   second. A budget drains first, and the higher the offered rate the sooner.
+2. **The throttling then oscillates on a ~60 second period.** `r8c4` in 30s
+   slices: 275 messages 0 throttles, then 91 and 78, then 174 and 17, then 120
+   and 58, alternating for the rest of the run. That is the window rolling
+   over. `r5c4`, under the budget, has no oscillation at all - a flat 150
+   messages per slice for thirteen consecutive slices.
+3. **Successes are conserved and attempts are not.** See the table. Whatever
+   is metered is consumed by calls that return data; requests rejected for
+   quota are evidently cheap or free, which is why a 60% increase in attempts
+   yields no more messages.
+
+The sustainable ceiling is **300 to 314 successful `messages.get` per minute**,
+bracketed directly: `--rate 5` offers 300/min and draws 3 throttles in an
+entire run; `--rate 6` offers 360/min, is clamped back to 314/min, and draws
+251.
+
+That number also resolves the original puzzle in one line. The pinned fetch and
+the restore did not make calls at the same rate. The fetch was *offering* 8
+req/s and being cut back to 5.17; the restore was latency-bound at 1.55 s/call
+across 8 workers and could only *offer* 5.17. One is an outcome, the other an
+input. The restore drew no throttles because it never asked for more than the
+budget - it sat, by coincidence, just under a ceiling nobody had measured.
+
+### The ceiling above 8 req/s (TODO item 2)
+
+Answered, and the answer is that there is nothing up there.
+
+| pinned at | delivered | throttles | lost |
+|---|---|---|---|
+| 8  | 5.16 msg/s | 488 | 2 |
+| 12 | 5.70 msg/s | 504 | 2 |
+| 16 | 5.61 msg/s | 536 | 1 |
+
+The 10% gain from 8 to 12 is real, but it is not headroom - it is recovery
+speed, refilling faster in the seconds after a window rolls over. Note also
+that `--rate 16` never offered 16: at concurrency 4 the clean-phase rate topped
+out at 14.4 req/s, which is `concurrency / latency`, not the pin. Four workers
+cannot offer more than about 14 req/s whatever the flag says.
+
+The shipped default is `--rate 8 --concurrency 12`, which delivered 5.57 msg/s
+- within 2.3% of the fastest configuration measured anywhere in this sweep.
+**There is no case for raising `RATE_DEFAULT`, and none is proposed.**
+
+### A proposal, not a change
+
+The interesting direction turns out to be down, not up. Three things in the
+data argue for it, and all three are the repo owner's call:
+
+- **`--rate 5` delivers 88% of the fastest throughput ever measured for 0.6%
+  of its throttles** - 5.00 msg/s against 5.70, three throttles against 504.
+  Over a full 35,000-message inbox that is about 20 minutes slower.
+- **Throttling is not free.** Every configuration at or above 6 req/s lost
+  messages: one to three per 2,000, each after exhausting all twelve retries,
+  each purely for quota. `--rate 5` lost none and cached 2,000 of 2,000. An
+  undercounted sender is a ranking bug, not a slow scan, and `CLAUDE.md`
+  already treats dropped messages as a correctness problem rather than a
+  performance one.
+- **If concurrency is tuned at all it should come down, not up.**
+  `--rate 12 --concurrency 4` was the fastest run and drew 42% fewer throttles
+  than the shipped default (504 against 868).
+
+Both changes belong to item 4, which stays gated. What has changed is that the
+mechanism is measured rather than guessed: a controller that paces against a
+per-minute budget is a different algorithm from AIMD-on-rate, not a retune of
+one, and this section is the specification it was waiting for. The minimal
+version is not even adaptive - the budget appears to be a constant, and
+`--rate 5` is already the controller.
+
+### The one number this cannot see from outside
+
+The observed ceiling is roughly 307 successful metadata `get` calls per minute.
+At the documented cost of 5 units per call that is about **1,535 units per
+minute**, which is 10% of the 15,000 units/minute/user Gmail documents as the
+default. Either
+
+- this project's per-user budget really is about 1,500 units/minute, or
+- one `messages.get` through this client costs about **45 to 50 units**, not 5
+  - which is what 15,000 divided by 300-342 works out to.
+
+The second would be nine times the documented cost, and a candidate mechanism
+is already recorded above: `gws` prints `Using keyring backend: keyring` on
+every single invocation, so it reloads credentials once per message, and a
+process that also refreshes or validates a token is doing billed work this tool
+never counted. That has been a hunch in this document twice. It is now the
+difference between two specific numbers.
+
+Nothing inside this tool can separate them - a 429 names the limit, not the
+balance. The Cloud console's quota page for the Gmail API can, in one look, and
+that is the next measurement worth making. It also bears directly on the
+"direct HTTPS instead of subprocess-per-message - rejected" decision in
+`DESIGN-UI.md`: that was rejected on the grounds that subprocess cost was
+latency the limiter could absorb. If it is *quota*, the premise was wrong, and
+the credential-handling and `--sanitize` objections would have to be weighed
+against a nine-fold quota multiplier rather than against convenience.
