@@ -187,6 +187,31 @@ def test_a_safeguard_still_holds_at_the_trash_boundary():
 
 
 # ------------------------------------------------- structural safety checks
+def test_every_text_file_names_its_encoding():
+    """Windows defaults to cp1252, and this tool's files are full of non-ASCII:
+    sender display names, subjects, the manifest written with
+    ensure_ascii=False. One open() without encoding="utf-8" is a
+    UnicodeDecodeError on somebody's mailbox and nobody else's. The rule is
+    already documented for subprocess output; it applies just as much to the
+    files the tool writes and reads back."""
+    tree = ast.parse(open(SOURCE, encoding="utf-8").read())
+    missing = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call)
+                and getattr(node.func, "id", "") == "open"):
+            continue
+        mode = ""
+        if len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
+            mode = node.args[1].value or ""
+        if "b" in mode:
+            continue  # bytes have no encoding to get wrong
+        if "encoding" not in {k.arg for k in node.keywords}:
+            missing.append(node.lineno)
+    assert not missing, (
+        "open() without encoding= at line(s) {}; cp1252 is the Windows "
+        "default and these files are not ASCII".format(missing))
+
+
 def test_no_permanent_delete_code_path():
     """The tool must be structurally incapable of permanent deletion."""
     src = open(SOURCE, encoding="utf-8").read()

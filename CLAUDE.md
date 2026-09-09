@@ -239,7 +239,7 @@ docs/SETUP.md             OAuth setup, troubleshooting, platform notes
 docs/DESIGN-UI.md         proposed web UI (not implemented; Phase 1 shipped)
 docs/PLAN-RATE-LIMITER.md how the shared rate limiter works, and why
 docs/images/*.svg         hand-authored setup diagrams
-tests/test_audit.py       116 offline tests, no API access needed
+tests/test_audit.py       117 offline tests, no API access needed
 tests/fixtures/           synthetic headers, example.com domains only
 tests/check_diagrams.py   geometric checks on the SVGs
 ```
@@ -328,8 +328,13 @@ works there — which makes this look like an auth bug when it is not.
 bare name (`WinError 2`). `_find_gws()` resolves the real `.exe`; `GWS_BIN`
 overrides it.
 
-**Force UTF-8 on subprocess output.** Header values routinely contain
-non-ASCII and Windows' cp1252 default raises `UnicodeDecodeError` mid-fetch.
+**Force UTF-8 on subprocess output, and on every file.** Header values
+routinely contain non-ASCII and Windows' cp1252 default raises
+`UnicodeDecodeError` mid-fetch. The same applies to the files this tool writes
+and reads back: the manifest is written with `ensure_ascii=False`, so a single
+`open()` without `encoding="utf-8"` is a crash on somebody's mailbox and
+nobody else's. `test_every_text_file_names_its_encoding` walks the parsed tree
+and fails on any text-mode `open()` that omits it.
 
 **Windows resets a connection closed with an unread request body.** Closing a
 socket that still has buffered received bytes sends RST rather than FIN, so the
