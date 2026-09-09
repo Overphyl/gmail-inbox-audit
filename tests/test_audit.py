@@ -8,6 +8,7 @@ import argparse
 import ast
 import collections
 import contextlib
+import datetime
 import fnmatch
 import heapq
 import http.client
@@ -1311,6 +1312,92 @@ def test_a_failed_untrash_is_not_counted_as_a_success():
         out, exit_msg = _run_mutation(g.cmd_untrash, a, set(ids[:3]))
     assert "Restored 7 messages to the inbox." in out, out[-300:]
     assert exit_msg is not None and "3 of 10 messages FAILED" in exit_msg, exit_msg
+
+
+@contextlib.contextmanager
+def _in(d):
+    """Run in d, and come back. Windows cannot delete a directory that is a
+    process's cwd, so the restore has to happen before the tempdir is."""
+    orig = os.getcwd()
+    try:
+        os.chdir(d)
+        yield
+    finally:
+        os.chdir(orig)
+
+
+def test_a_second_trash_run_does_not_overwrite_the_first_undo_list():
+    """cmd_trash opened one fixed path with 'w', so trashing a second batch
+    destroyed the first batch's manifest and the only warning was a person
+    remembering to copy the file. The undo list is the recovery path for an
+    operation that moves real mail; it must not be the thing that quietly goes
+    missing."""
+    with tempfile.TemporaryDirectory() as d, _in(d):
+        first = _run_mutation(g.cmd_trash, _trash_args(d, manifest=None))[0]
+        second = _run_mutation(g.cmd_trash, _trash_args(d, manifest=None))[0]
+        written = sorted(f for f in os.listdir(".")
+                         if f.startswith(g.MANIFEST_PREFIX))
+        sizes = [len(open(f, encoding="utf-8").read().splitlines())
+                 for f in written]
+    assert len(written) == 2, written
+    assert sizes[0] == sizes[1] > 0, sizes
+    for out in (first, second):
+        assert "Manifest written" in out, out[:200]
+
+
+def test_an_explicit_manifest_is_honoured_exactly():
+    """The default is per-run, but a named path is a decision, not a hint."""
+    with tempfile.TemporaryDirectory() as d, _in(d):
+        named = os.path.join(d, "keep-this.jsonl")
+        _run_mutation(g.cmd_trash, _trash_args(d, manifest=named))
+        assert os.path.exists(named)
+        assert not [f for f in os.listdir(".")
+                    if f.startswith(g.MANIFEST_PREFIX)]
+
+
+def test_manifest_names_never_collide():
+    """Two runs in the same second would be silent, which is the combination
+    worth guarding."""
+    with tempfile.TemporaryDirectory() as d, _in(d):
+        when = datetime.datetime(2026, 9, 9, 11, 30, 45)
+        seen = []
+        for _ in range(3):
+            p = g.manifest_path(when)
+            open(p, "w", encoding="utf-8").close()
+            seen.append(p)
+    assert len(set(seen)) == 3, seen
+
+
+def test_untrash_picks_the_most_recent_run_and_says_which():
+    """Restoring the wrong run is the failure this command exists to prevent,
+    so the choice is printed - and a dry run is the default, so there is a
+    chance to read it before anything moves."""
+    with tempfile.TemporaryDirectory() as d, _in(d):
+        old = g.manifest_path(datetime.datetime(2026, 9, 1, 9, 0, 0))
+        with open(old, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"id": "OLD1"}) + "\n")
+        new = g.manifest_path(datetime.datetime(2026, 9, 9, 9, 0, 0))
+        with open(new, "w", encoding="utf-8") as f:
+            for i in range(4):
+                f.write(json.dumps({"id": "NEW{}".format(i)}) + "\n")
+        os.utime(old, (1000, 1000))          # unambiguously older
+        os.utime(new, (2000, 2000))
+        a = argparse.Namespace(sanitize=None, manifest=None, concurrency=2,
+                               execute=False)
+        out, exit_msg = _run_mutation(g.cmd_untrash, a)
+    assert exit_msg is None, exit_msg
+    assert os.path.basename(new) in out, out
+    assert "1 other present" in out, out
+    assert "Restoring 4 messages" in out, out
+
+
+def test_untrash_with_nothing_to_restore_says_so():
+    with tempfile.TemporaryDirectory() as d, _in(d):
+        a = argparse.Namespace(sanitize=None, manifest=None, concurrency=2,
+                               execute=False)
+        out, exit_msg = _run_mutation(g.cmd_untrash, a)
+    assert exit_msg is not None and "no manifest found" in exit_msg, exit_msg
+    assert "--manifest" in exit_msg, exit_msg
 
 
 def test_rank_rows_is_the_single_ranking():

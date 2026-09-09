@@ -105,9 +105,21 @@ so no parser catches it; refusing the run is what stops it being silent. The
 plain `--senders` path keeps the softer note, because there the list is
 hand-written by design.
 
-**Manifest before mutation.** `cmd_trash` writes every target message ID to
-disk *before* trashing anything, so an interrupted run still leaves a complete
-undo list for `cmd_untrash`.
+**Manifest before mutation, and one manifest per run.** `cmd_trash` writes
+every target message ID to disk *before* trashing anything, so an interrupted
+run still leaves a complete undo list for `cmd_untrash`.
+
+It used to write one fixed path with `"w"`, so trashing a second batch
+destroyed the first batch's undo list and the only warning was a person
+remembering to copy the file. The undo list is the recovery path for an
+operation that moves real mail; it must not be the thing that quietly goes
+missing. `manifest_path()` names it for the run's timestamp and never returns a
+path that exists; an explicit `--manifest` is honoured exactly, because a named
+path is a decision. `cmd_untrash` with no `--manifest` takes
+`latest_manifest()` - newest by mtime, so a manifest renamed to something
+meaningful is still undoable - and *prints which one it chose*, since restoring
+the wrong run is the failure that command exists to prevent and a dry run is
+the default. Five tests.
 
 **A mutation count is a count of successes, never of attempts.** `_safe_mutate`
 swallows the error so one bad message cannot abandon the batch, which means the
@@ -208,7 +220,7 @@ docs/SETUP.md             OAuth setup, troubleshooting, platform notes
 docs/DESIGN-UI.md         proposed web UI (not implemented; Phase 1 shipped)
 docs/PLAN-RATE-LIMITER.md how the shared rate limiter works, and why
 docs/images/*.svg         hand-authored setup diagrams
-tests/test_audit.py       106 offline tests, no API access needed
+tests/test_audit.py       111 offline tests, no API access needed
 tests/fixtures/           synthetic headers, example.com domains only
 tests/check_diagrams.py   geometric checks on the SVGs
 ```

@@ -1822,11 +1822,14 @@ def cmd_trash(a):
         sys.exit("\nnothing matched - stopping")
 
     # Manifest is written BEFORE any mutation, so a complete undo list exists
-    # even if the run is interrupted.
-    with open(a.manifest, "w", encoding="utf-8") as f:
+    # even if the run is interrupted. One per run: an explicit --manifest is
+    # honoured exactly, otherwise the name carries the run's timestamp so a
+    # later batch cannot overwrite an earlier batch's undo list.
+    manifest = a.manifest or manifest_path()
+    with open(manifest, "w", encoding="utf-8") as f:
         for t in targets:
             f.write(json.dumps(t, ensure_ascii=False) + "\n")
-    print("\nManifest written: {} ({} ids)".format(a.manifest, len(targets)))
+    print("\nManifest written: {} ({} ids)".format(manifest, len(targets)))
 
     if not a.execute:
         print("\nDRY RUN - nothing was modified.")
@@ -1872,7 +1875,7 @@ def cmd_trash(a):
         print("  trashed {}/{}{}".format(
             done, len(targets), " ({} failed)".format(failed) if failed else ""))
 
-    print("To undo: python gmail_audit.py untrash --manifest {}".format(a.manifest))
+    print("To undo: python gmail_audit.py untrash --manifest {}".format(manifest))
     _report_mutations(
         "Done. {} messages moved to Trash (recoverable for 30 days).",
         done, failed,
@@ -1883,15 +1886,32 @@ def cmd_trash(a):
 
 def cmd_untrash(a):
     """Restore everything listed in a manifest. The undo for cmd_trash."""
-    if not os.path.exists(a.manifest):
-        sys.exit("manifest not found: {}".format(a.manifest))
+    manifest = a.manifest
+    if not manifest:
+        manifest = latest_manifest()
+        if not manifest:
+            sys.exit(
+                "no manifest found. A trash run writes one named {}-<when>"
+                ".jsonl;\nname the file to restore with --manifest.".format(
+                    MANIFEST_PREFIX))
+        others = [f for f in os.listdir(".")
+                  if f.startswith(MANIFEST_PREFIX) and f.endswith(".jsonl")]
+        # Named, never assumed: restoring the wrong run is the failure this
+        # command exists to prevent, and a dry run is the default so there is
+        # a chance to read this line before anything moves.
+        print("Using the most recent manifest: {}{}".format(
+            manifest,
+            "  ({} present)".format(_plural(len(others) - 1, "other"))
+            if len(others) > 1 else ""))
+    if not os.path.exists(manifest):
+        sys.exit("manifest not found: {}".format(manifest))
     ids = []
-    with open(a.manifest, encoding="utf-8") as f:
+    with open(manifest, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
                 ids.append(json.loads(line)["id"])
-    print("Restoring {} messages from {}".format(len(ids), a.manifest))
+    print("Restoring {} messages from {}".format(len(ids), manifest))
     if not a.execute:
         print("DRY RUN - re-run with --execute to restore.")
         return
@@ -1904,7 +1924,53 @@ def cmd_untrash(a):
                 done += 1
     _report_mutations(
         "Restored {} messages to the inbox.", done, failed,
-        "python gmail_audit.py untrash --manifest {} --execute".format(a.manifest))
+        "python gmail_audit.py untrash --manifest {} --execute".format(manifest))
+
+
+# One manifest per run, named for when the run happened. cmd_trash opened a
+# single fixed path with "w", so trashing a second batch destroyed the first
+# batch's undo list - and the only warning was a person remembering to copy the
+# file. The undo list is the recovery path for an operation that moves real
+# mail; it must not be the thing that quietly goes missing.
+MANIFEST_PREFIX = "trashed-manifest"
+
+
+def manifest_path(when=None, directory="."):
+    """A fresh manifest path. Never returns one that already exists."""
+    when = when or datetime.datetime.now()
+    base = "{}-{}".format(MANIFEST_PREFIX, when.strftime("%Y%m%d-%H%M%S"))
+    # Not os.path.join for the common case: "./trashed-manifest-....jsonl" is
+    # the string a person pastes into the undo command, and the "./" is noise.
+    if directory not in ("", "."):
+        base = os.path.join(directory, base)
+    path = base + ".jsonl"
+    # Two runs in the same second are unlikely and would be silent, which is
+    # the combination worth spending three lines on.
+    n = 2
+    while os.path.exists(path):
+        path = "{}-{}.jsonl".format(base, n)
+        n += 1
+    return path
+
+
+def latest_manifest(directory="."):
+    """The most recently written manifest, or None.
+
+    By mtime rather than by name: a manifest the user renamed to something
+    meaningful is still theirs to undo, and the timestamp in the default name
+    is for reading, not for sorting.
+    """
+    try:
+        names = os.listdir(directory or ".")
+    except OSError:
+        return None
+    found = [f if directory in ("", ".") else os.path.join(directory, f)
+             for f in names
+             if f.startswith(MANIFEST_PREFIX) and f.endswith(".jsonl")]
+    found = [f for f in found if os.path.isfile(f)]
+    if not found:
+        return None
+    return max(found, key=lambda f: os.stat(f).st_mtime)
 
 
 def _safe_mutate(fn, msg_id, sanitize):
@@ -3075,8 +3141,11 @@ def main():
                           "automatically, so 'any' immunises nearly every "
                           "high-volume sender. STARRED always guards.")
     t.add_argument("--cache", default="headers.jsonl")
-    t.add_argument("--manifest", default="trashed-manifest.jsonl",
-                   help="written before any mutation; used by 'untrash'")
+    t.add_argument("--manifest", default=None,
+                   help="written before any mutation; used by 'untrash'. "
+                        "Default: {}-<when>.jsonl, one per run, so a later "
+                        "batch cannot overwrite an earlier batch's undo "
+                        "list".format(MANIFEST_PREFIX))
     t.add_argument("--batch", type=int, default=250)
     t.add_argument("--concurrency", type=int, default=8)
     t.add_argument("--execute", action="store_true",
@@ -3099,7 +3168,9 @@ def main():
     w.set_defaults(func=cmd_ui)
 
     u = sub.add_parser("untrash", help="restore messages from a manifest")
-    u.add_argument("--manifest", default="trashed-manifest.jsonl")
+    u.add_argument("--manifest", default=None,
+                   help="which run to undo (default: the most recently "
+                        "written {}-*.jsonl)".format(MANIFEST_PREFIX))
     u.add_argument("--concurrency", type=int, default=8)
     u.add_argument("--execute", action="store_true")
     _add_rate_args(u)

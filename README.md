@@ -289,14 +289,27 @@ python gmail_audit.py trash --review review.txt              # dry run
 python gmail_audit.py trash --review review.txt --execute
 ```
 
-Prompts between batches. Writes `trashed-manifest.jsonl` before touching
-anything.
+Prompts between batches. Writes the manifest before touching anything.
+
+**One manifest per run**, named for when the run happened
+(`trashed-manifest-20260909-113045.jsonl`), so trashing a second batch cannot
+overwrite the first batch's undo list. `--manifest <path>` overrides the name.
 
 ### Undo
 
 ```bash
-python gmail_audit.py untrash --manifest trashed-manifest.jsonl --execute
+python gmail_audit.py untrash                 # dry run, most recent run
+python gmail_audit.py untrash --execute
 ```
+
+With no `--manifest` it takes the most recently written one and prints which,
+so an unintended choice is visible before anything moves. Name an older run
+with `--manifest <path>` to undo that one instead.
+
+Both commands report **successes**, not attempts, and exit non-zero if any
+message failed. The manifest lists every target whether or not its call
+succeeded, and both operations are idempotent, so re-running the same command
+retries exactly the failures.
 
 Or empty Gmail's Trash yourself after 30 days if you're satisfied.
 
