@@ -606,6 +606,49 @@ In rough order of confidence:
    because it bounds what a correct controller could even achieve. Until then a
    user with more quota raises it by hand with `--rate`.
 
+### A second measurement: the mutation path is latency-bound, not quota-bound
+
+A 1,108-message restore on 2026-09-09, pinned at the new default of 8 req/s
+with concurrency 8. Each message costs two API calls, `messages.untrash` then
+an add-only `messages.modify`:
+
+| | |
+|---|---|
+| API calls | 2,216 |
+| elapsed | 428.8 s |
+| **calls/s** | **5.17** |
+| concurrency | 8 |
+| implied mean latency per call | **1.55 s** |
+| **throttles** | **0** |
+| limiter state | `pinned` at 8.0/s, never binding |
+
+Two things fall out of that, and the second is more interesting than the first.
+
+**The pin was never reached.** The limiter was set to 8 req/s and the fleet
+managed 5.17. Nothing was waiting on the limiter, so the ceiling here is
+`concurrency / latency`: eight workers each spending about 1.55 seconds per
+call. That is subprocess cost, not quota. It is the strongest evidence yet for
+the note under "Two things the drop file also exposed" - `gws` loads its
+keyring on every invocation, and the tool spawns one process per message.
+
+**Zero throttles, at a call rate that throttled the scan.** The pinned fetch
+run reached 5.17 msg/s and was throttled 646 times, about 20% of requests. This
+run made calls at the same rate and drew none at all. Both estimate to roughly
+1,550 units per minute if every call costs 5, which is far under the documented
+per-user ceiling either way.
+
+So the fetch throttling is not explained by the steady-state call rate, and the
+obvious suspects are the ones the fetch path has and this one does not:
+`list_ids` pagination running alongside the fetch, and concurrency 12 rather
+than 8. Neither is measured. What this run does establish is that a sustained
+5.17 calls/s against a real mailbox is not, by itself, enough to draw a single
+throttle - which means the earlier runs' throttling has a cause still not
+identified, and the AIMD controller was reacting to something it never
+diagnosed.
+
+**Do not read this as "the limit is 5.17/s".** It is where *this* client tops
+out at concurrency 8, entirely because of how it talks to the API.
+
 ### What survives
 
 The parts of this design that are not the controller came through intact:
