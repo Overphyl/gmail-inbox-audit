@@ -212,6 +212,25 @@ the parsed tree for any `kill` call, so a comment may name it but code may not.
 wrapped and swallowed, and goes through a temp file plus `os.replace` so a
 reader polling it never sees half a document.
 
+**A mutation reports progress like a scan does.** `cmd_trash` and `cmd_untrash`
+build a `FetchProgress`, run through `_mutate()` and publish through
+`StatusWriter`, so the live line, the rate, the ETA and `gmail_audit.py status`
+work identically on a restore and on a fetch. Every long-running command here
+published progress *except* the two that move mail, which is backwards: a scan
+you cannot see is an annoyance, a mutation you cannot see is the one you most
+want to watch. A real 1,108-message restore printed one line and then nothing
+for four minutes. `trash` starts its reporter per batch rather than around the
+loop, because the live line writes to stderr with a carriage return and would
+scribble over the `[y/N]` prompt. The test asserts a *mid-run* tick, not just
+the closing write: a run that went silent and then published a finished file
+would pass the weaker check, and that is exactly the bug.
+
+No drop file on these paths: the manifest already names every target, and both
+commands are idempotent, so re-running retries exactly the failures. The
+circuit breaker does apply, and counts only *non-retryable* failures - a
+throttle means the fleet is too fast, not that the run is doomed, and counting
+it would abort long runs on a healthy mailbox. Two tests, one per direction.
+
 ## Layout
 
 ```
@@ -220,7 +239,7 @@ docs/SETUP.md             OAuth setup, troubleshooting, platform notes
 docs/DESIGN-UI.md         proposed web UI (not implemented; Phase 1 shipped)
 docs/PLAN-RATE-LIMITER.md how the shared rate limiter works, and why
 docs/images/*.svg         hand-authored setup diagrams
-tests/test_audit.py       111 offline tests, no API access needed
+tests/test_audit.py       116 offline tests, no API access needed
 tests/fixtures/           synthetic headers, example.com domains only
 tests/check_diagrams.py   geometric checks on the SVGs
 ```
@@ -245,7 +264,7 @@ tests/check_diagrams.py   geometric checks on the SVGs
 | Guard + coverage + signals, one rendering | `row_notes()` |
 | The review file, both directions | `write_review()`, `parse_review()`, `load_review_approved()` |
 | Cross-process scan status | `StatusWriter`, `read_status()`, `cmd_status()` |
-| Mutation | `_trash_one()`, `cmd_trash()`, `cmd_untrash()` |
+| Mutation | `_trash_one()`, `_mutate()`, `cmd_trash()`, `cmd_untrash()` |
 | Auth preflight and its error classification | `preflight()`, `classify_gws_error()`, `UI_ERRORS`, `UI_HINTS`, `PREFLIGHT_LABELS` |
 | First-run readiness check | `cmd_doctor()` |
 | The required replied-to safeguard | `require_engaged()`, `load_engaged()` |

@@ -582,8 +582,10 @@ class FetchProgress:
                 print("  ! {}: {}".format(msg_id, text), file=sys.stderr)
                 if self._drop_lines == self.MAX_DROP_LINES:
                     print(
-                        "  ! (further failures suppressed; {} has them all)".format(
-                            self.drop_path or "the counters below"
+                        "  ! (further failures suppressed; {})".format(
+                            "{} has them all".format(self.drop_path)
+                            if self.drop_path else
+                            "the count below is complete"
                         ),
                         file=sys.stderr,
                     )
@@ -713,6 +715,11 @@ def _progress_reporter(progress, limiter, stop, interval=2.0, plain_every=10.0,
 # answer, and cmd_ui can only report on scans it started itself.
 FETCH_STATUS = "fetch-status.json"
 ENGAGED_STATUS = "engaged-status.json"
+# The two commands that move mail publish too. Every long-running command here
+# reported progress EXCEPT those two, which is backwards: a scan you cannot see
+# is an annoyance, a mutation you cannot see is the one you most want to watch.
+TRASH_STATUS = "trash-status.json"
+UNTRASH_STATUS = "untrash-status.json"
 STATUS_STALE_AFTER = 15.0  # ~7 missed reporter ticks
 
 
@@ -843,7 +850,8 @@ def _status_lines(d):
 
 def cmd_status(a):
     """Report on a scan running in another terminal, or the last one to run."""
-    paths = a.files or [FETCH_STATUS, ENGAGED_STATUS]
+    paths = a.files or [FETCH_STATUS, ENGAGED_STATUS, TRASH_STATUS,
+                        UNTRASH_STATUS]
     found = [d for d in (read_status(p) for p in paths) if d]
     if a.json:
         print(json.dumps(found, indent=2))
@@ -1848,40 +1856,52 @@ def cmd_trash(a):
         if resp.strip().lower() != "override":
             sys.exit("stopped - nothing was modified.")
 
-    done = failed = 0
-    for start in range(0, len(targets), a.batch):
-        chunk = targets[start : start + a.batch]
-        if not a.yes:
-            resp = input(
-                "\nTrash batch {} ({} messages)? [y/N] ".format(
-                    start // a.batch + 1, len(chunk)
+    progress = FetchProgress(len(targets))
+    status = StatusWriter(getattr(a, "status", "") or None, "trash",
+                          cache=manifest)
+    interrupted = False
+    try:
+        for start in range(0, len(targets), a.batch):
+            chunk = targets[start : start + a.batch]
+            if not a.yes:
+                resp = input(
+                    "\nTrash batch {} ({} messages)? [y/N] ".format(
+                        start // a.batch + 1, len(chunk)
+                    )
                 )
-            )
-            if resp.strip().lower() not in ("y", "yes"):
-                print("stopped at batch {} - {} already trashed".format(
-                    start // a.batch + 1, done))
-                return
-        with ThreadPoolExecutor(max_workers=a.concurrency) as ex:
-            for got in ex.map(
-                lambda t: _safe_mutate(_trash_one, t["id"], a.sanitize), chunk
-            ):
-                # The return value, not the iteration: _safe_mutate swallows
-                # the error so one bad message cannot abandon the batch, which
-                # means the loop runs either way.
-                if got is None:
-                    failed += 1
-                else:
-                    done += 1
-        print("  trashed {}/{}{}".format(
-            done, len(targets), " ({} failed)".format(failed) if failed else ""))
+                if resp.strip().lower() not in ("y", "yes"):
+                    print("stopped at batch {} - {} already trashed".format(
+                        start // a.batch + 1, progress.done))
+                    return
+            # Started per batch, not once around the loop: the live line writes
+            # to stderr with a carriage return, and a reporter running across
+            # the input() above would scribble over the prompt.
+            stop, reporter = _with_reporter(progress, status)
+            try:
+                _mutate([t["id"] for t in chunk], _trash_one, a, progress)
+            finally:
+                stop.set()
+                reporter.join(timeout=5.0)
+            print("  trashed {}/{}{}".format(
+                progress.done, len(targets),
+                " ({} failed)".format(progress.dropped)
+                if progress.dropped else ""))
+            if progress.aborted:
+                break
+    except KeyboardInterrupt:
+        interrupted = True
+    finally:
+        status.write(progress, LIMITER,
+                     state=_final_state(progress, interrupted))
 
     print("To undo: python gmail_audit.py untrash --manifest {}".format(manifest))
     _report_mutations(
         "Done. {} messages moved to Trash (recoverable for 30 days).",
-        done, failed,
+        progress.done, progress.dropped,
         "python gmail_audit.py trash --review {} --execute".format(a.review)
         if getattr(a, "review", None) else
-        "python gmail_audit.py trash --senders {} --execute".format(a.senders))
+        "python gmail_audit.py trash --senders {} --execute".format(a.senders),
+        aborted=progress.aborted)
 
 
 def cmd_untrash(a):
@@ -1915,16 +1935,27 @@ def cmd_untrash(a):
     if not a.execute:
         print("DRY RUN - re-run with --execute to restore.")
         return
-    done = failed = 0
-    with ThreadPoolExecutor(max_workers=a.concurrency) as ex:
-        for got in ex.map(lambda i: _safe_mutate(_untrash_one, i, a.sanitize), ids):
-            if got is None:
-                failed += 1
-            else:
-                done += 1
+    progress = FetchProgress(len(ids))
+    status = StatusWriter(getattr(a, "status", "") or None, "untrash",
+                          cache=manifest)
+    stop, reporter = _with_reporter(progress, status)
+    interrupted = False
+    try:
+        _mutate(ids, _untrash_one, a, progress)
+    except KeyboardInterrupt:
+        interrupted = True
+    finally:
+        stop.set()
+        reporter.join(timeout=5.0)
+        status.write(progress, LIMITER,
+                     state=_final_state(progress, interrupted))
     _report_mutations(
-        "Restored {} messages to the inbox.", done, failed,
-        "python gmail_audit.py untrash --manifest {} --execute".format(manifest))
+        # "from Trash", not "to the inbox": untrash removes the TRASH label,
+        # and where a message then appears depends on the labels it still
+        # carries. Claiming the inbox is a claim this tool has not verified.
+        "Restored {} messages from Trash.", progress.done, progress.dropped,
+        "python gmail_audit.py untrash --manifest {} --execute".format(manifest),
+        aborted=progress.aborted)
 
 
 # One manifest per run, named for when the run happened. cmd_trash opened a
@@ -1973,26 +2004,60 @@ def latest_manifest(directory="."):
     return max(found, key=lambda f: os.stat(f).st_mtime)
 
 
-def _safe_mutate(fn, msg_id, sanitize):
+def _safe_mutate(fn, msg_id, sanitize, on_drop=None):
     """Run one mutation. Returns the id on success, None on failure.
 
     The None is the whole point: a caller that counts iterations rather than
     return values reports every attempt as a success, which is the one
     direction this number must never be wrong in.
+
+    `on_drop` is FetchProgress.record_drop, which counts the failure, prints
+    it, and stops printing after twenty - the same treatment a scan's failures
+    get. Without it the fallback is an unbounded wall of stderr.
     """
     try:
         return fn(msg_id, sanitize)
     except Exception as e:
-        print("  ! {}: {}".format(msg_id, e), file=sys.stderr)
+        if on_drop is not None:
+            on_drop(msg_id, e)
+        else:
+            print("  ! {}: {}".format(msg_id, e), file=sys.stderr)
         return None
 
 
-def _report_mutations(what, done, failed, retry):
+def _mutate(ids, fn, a, progress):
+    """Run one pool of mutations, counting successes and failures.
+
+    Shared by trash and untrash so there is one place that knows a mutation is
+    counted by its return value. No drop file: the manifest already names every
+    target, and re-running either command retries exactly the failures.
+    """
+    def one(msg_id):
+        if progress.aborted:
+            return None  # drain fast rather than joining a doomed pool slowly
+        return _safe_mutate(fn, msg_id, a.sanitize, on_drop=progress.record_drop)
+
+    with ThreadPoolExecutor(max_workers=a.concurrency) as ex:
+        try:
+            for got in ex.map(one, ids):
+                if got is not None:
+                    progress.record_done()
+        except KeyboardInterrupt:
+            if LIMITER is not None:
+                LIMITER.shutdown()
+            progress.abort("interrupted")
+            raise
+
+
+def _report_mutations(what, done, failed, retry, aborted=None):
     """The closing line of a mutating run, and its exit status.
 
     `what` is a template taking the count, so each command keeps its own words.
     """
     print("\n" + what.format(done))
+    if aborted:
+        sys.exit("STOPPED: {}. {} of {} messages are unchanged.\nRetry with:"
+                 "\n    {}".format(aborted, failed, done + failed, retry))
     if not failed:
         return
     # Not a warning tucked under a success line: the run did not do what was
@@ -3117,8 +3182,10 @@ def main():
 
     st = sub.add_parser("status", help="report on a scan running elsewhere")
     st.add_argument("files", nargs="*",
-                    help="status files to read (default: {} and {})".format(
-                        FETCH_STATUS, ENGAGED_STATUS))
+                    help="status files to read (default: the {} a scan or a "
+                         "mutation writes)".format(
+                             ", ".join([FETCH_STATUS, ENGAGED_STATUS,
+                                        TRASH_STATUS, UNTRASH_STATUS])))
     st.add_argument("--json", action="store_true")
     st.set_defaults(func=cmd_status)
 
@@ -3152,7 +3219,7 @@ def main():
                    help="actually trash; omit for a dry run")
     t.add_argument("--yes", action="store_true",
                    help="skip the per-batch confirmation prompt")
-    _add_rate_args(t)
+    _add_rate_args(t, status_default=TRASH_STATUS)
     t.set_defaults(func=cmd_trash)
 
     w = sub.add_parser("ui", help="local web UI: preflight and scan progress")
@@ -3173,7 +3240,7 @@ def main():
                         "written {}-*.jsonl)".format(MANIFEST_PREFIX))
     u.add_argument("--concurrency", type=int, default=8)
     u.add_argument("--execute", action="store_true")
-    _add_rate_args(u)
+    _add_rate_args(u, status_default=UNTRASH_STATUS)
     u.set_defaults(func=cmd_untrash)
 
     a = p.parse_args()

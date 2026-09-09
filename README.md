@@ -306,8 +306,12 @@ With no `--manifest` it takes the most recently written one and prints which,
 so an unintended choice is visible before anything moves. Name an older run
 with `--manifest <path>` to undo that one instead.
 
-Both commands report **successes**, not attempts, and exit non-zero if any
-message failed. The manifest lists every target whether or not its call
+Both commands print a live progress line with rate and ETA, and publish a
+status file, so `python gmail_audit.py status` reports on a restore running in
+another terminal exactly as it does on a scan.
+
+Both report **successes**, not attempts, and exit non-zero if any message
+failed. The manifest lists every target whether or not its call
 succeeded, and both operations are idempotent, so re-running the same command
 retries exactly the failures.
 

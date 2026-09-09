@@ -12,6 +12,7 @@ import datetime
 import fnmatch
 import heapq
 import http.client
+import inspect
 import io
 import json
 import os
@@ -1232,14 +1233,16 @@ def test_review_header_records_the_important_mode():
     assert "IMPORTANT guard: off" in head, head
 
 
-def _run_mutation(fn, args, fail_ids=()):
+def _run_mutation(fn, args, fail_ids=(), error="429 rate limit"):
     """Run a mutating command with some message IDs made to fail.
 
-    Returns (stdout, exit_message or None).
+    Returns (stdout, exit_message or None). The default error is a throttle,
+    which is deliberately RETRYABLE: the circuit breaker counts consecutive
+    non-retryable failures only, so a test that wants it to fire has to say so.
     """
     def flaky(msg_id, sanitize=None):
         if msg_id in fail_ids:
-            raise RuntimeError("429 rate limit")
+            raise RuntimeError(error)
         return msg_id
 
     orig_t, orig_u = g._trash_one, g._untrash_one
@@ -1310,7 +1313,7 @@ def test_a_failed_untrash_is_not_counted_as_a_success():
         a = argparse.Namespace(sanitize=None, manifest=manifest,
                                concurrency=2, execute=True)
         out, exit_msg = _run_mutation(g.cmd_untrash, a, set(ids[:3]))
-    assert "Restored 7 messages to the inbox." in out, out[-300:]
+    assert "Restored 7 messages from Trash." in out, out[-300:]
     assert exit_msg is not None and "3 of 10 messages FAILED" in exit_msg, exit_msg
 
 
@@ -1398,6 +1401,134 @@ def test_untrash_with_nothing_to_restore_says_so():
         out, exit_msg = _run_mutation(g.cmd_untrash, a)
     assert exit_msg is not None and "no manifest found" in exit_msg, exit_msg
     assert "--manifest" in exit_msg, exit_msg
+
+
+def test_a_mutation_publishes_its_progress_like_a_scan():
+    """Every long-running command here reported progress except the two that
+    move mail, which is backwards: a scan you cannot see is an annoyance, a
+    mutation you cannot see is the one you most want to watch. A 1,108-message
+    restore printed one line and then nothing for four minutes."""
+    with tempfile.TemporaryDirectory() as d, _in(d):
+        manifest = os.path.join(d, "m.jsonl")
+        ids = ["MSG{}".format(i) for i in range(12)]
+        with open(manifest, "w", encoding="utf-8") as f:
+            for i in ids:
+                f.write(json.dumps({"id": i}) + "\n")
+        status = os.path.join(d, "untrash-status.json")
+        a = argparse.Namespace(sanitize=None, manifest=manifest, concurrency=2,
+                               execute=True, status=status)
+        _run_mutation(g.cmd_untrash, a, set(ids[:2]))
+        published = g.read_status(status)
+    assert published, "the mutation must publish a status file"
+    assert published["command"] == "untrash", published
+    assert published["state"] == "done", published
+    assert published["done"] == 10 and published["dropped"] == 2, published
+    assert published["total"] == 12, published
+
+
+def test_a_mutation_publishes_progress_while_it_is_still_running():
+    """The final write is the easy half and proves nothing: a 1,108-message
+    restore that printed one line, went silent for four minutes and then
+    published a finished status file would pass that. What was missing is the
+    reporter ticking DURING the run, which is the whole point of asking."""
+    orig_rep, orig_one = g._progress_reporter, g._untrash_one
+
+    def fast(progress, limiter, stop, interval=2.0, plain_every=10.0,
+             status=None):
+        # The real reporter, just ticking faster than a test can wait for.
+        return orig_rep(progress, limiter, stop, interval=0.02,
+                        plain_every=0.02, status=status)
+
+    def slow(msg_id, sanitize=None):
+        time.sleep(0.03)
+        return msg_id
+
+    with tempfile.TemporaryDirectory() as d, _in(d):
+        manifest = os.path.join(d, "m.jsonl")
+        with open(manifest, "w", encoding="utf-8") as f:
+            for i in range(60):
+                f.write(json.dumps({"id": "MSG{}".format(i)}) + "\n")
+        status = os.path.join(d, "untrash-status.json")
+        a = argparse.Namespace(sanitize=None, manifest=manifest, concurrency=2,
+                               execute=True, status=status)
+        mid = []
+        g._progress_reporter, g._untrash_one = fast, slow
+        try:
+            def run():
+                with contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    try:
+                        g.cmd_untrash(a)
+                    except SystemExit:
+                        pass
+
+            t = threading.Thread(target=run)
+            t.start()
+
+            def caught_mid_run():
+                d2 = g.read_status(status)
+                if d2 and d2["state"] == "running" and 0 < d2["done"] < 60:
+                    mid.append(d2)
+                    return True
+                return False
+
+            _wait_for(caught_mid_run, timeout=15)
+            t.join(timeout=15)
+            assert not t.is_alive(), "the restore never finished"
+            final = g.read_status(status)
+        finally:
+            g._progress_reporter, g._untrash_one = orig_rep, orig_one
+    assert mid, "no status was published while the run was in flight"
+    assert mid[0]["command"] == "untrash" and mid[0]["total"] == 60, mid[0]
+    assert final["state"] == "done" and final["done"] == 60, final
+
+
+def test_status_reads_a_mutation_without_being_told_where():
+    """`status` with no arguments has to cover the mutating commands too, or
+    the file they publish is one nobody looks at."""
+    for name in (g.TRASH_STATUS, g.UNTRASH_STATUS):
+        assert name.endswith("-status.json"), name
+        assert _gitignored(name), name
+    a = argparse.Namespace(sanitize=None, files=[], json=False)
+    src = inspect.getsource(g.cmd_status)
+    for const in ("TRASH_STATUS", "UNTRASH_STATUS"):
+        assert const in src, "status must look for {} by default".format(const)
+
+
+def _untrash_all(n, error):
+    """Run untrash over n ids, every one of them failing with `error`."""
+    with tempfile.TemporaryDirectory() as d, _in(d):
+        manifest = os.path.join(d, "m.jsonl")
+        ids = ["MSG{}".format(i) for i in range(n)]
+        with open(manifest, "w", encoding="utf-8") as f:
+            for i in ids:
+                f.write(json.dumps({"id": i}) + "\n")
+        a = argparse.Namespace(sanitize=None, manifest=manifest, concurrency=1,
+                               execute=True, status="")
+        return _run_mutation(g.cmd_untrash, a, set(ids), error=error)
+
+
+def test_a_mutation_stops_after_a_wall_of_systemic_failures():
+    """25 consecutive NON-RETRYABLE failures means something systemic - an
+    expired refresh token, a revoked scope - and hammering the remaining
+    thousand is waste. The manifest still names every target, so the run
+    stays resumable."""
+    out, exit_msg = _untrash_all(60, "invalid_grant: token has been expired")
+    assert exit_msg is not None, out
+    assert "STOPPED" in exit_msg and "consecutive" in exit_msg, exit_msg
+    assert "Retry with" in exit_msg, exit_msg
+    # It stopped rather than running the whole list.
+    assert "of 60 messages" not in exit_msg, exit_msg
+
+
+def test_throttles_never_trip_the_breaker():
+    """A throttle means the fleet is too fast, not that the run is doomed.
+    Counting it toward the breaker would abort long runs on a healthy
+    mailbox, which is the opposite of what the breaker is for."""
+    out, exit_msg = _untrash_all(60, "429 rate limit")
+    assert exit_msg is not None, out           # they all failed, so non-zero
+    assert "STOPPED" not in exit_msg, exit_msg  # ...but not by giving up
+    assert "60 of 60 messages FAILED" in exit_msg, exit_msg
 
 
 def test_rank_rows_is_the_single_ranking():
