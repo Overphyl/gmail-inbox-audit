@@ -321,7 +321,9 @@ Rate and concurrency are now separate knobs with separate jobs:
 - **The limiter governs the rate.** It is what keeps you under quota.
 - **`--concurrency` only covers latency.** A request takes roughly 0.35 s, so
   sustaining R req/s needs about `R * 0.35` workers in flight. The default of
-  12 supports roughly 34 req/s. `fetch` prints the implied ceiling at startup.
+  12 supports roughly 34 req/s, which is well clear of the ~5 calls/second the
+  quota budget allows a scan - so concurrency is not what limits a scan.
+  `fetch` prints both ceilings at startup.
 
 **Never go above 16.** That limit is unchanged and the limiter does not repeal
 it: above ~16 the API drops messages outright, which undercounts senders and
@@ -343,9 +345,10 @@ immediately before a real run leaves you throttled at the start.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--rate` | `0` (adaptive) | Pin a fixed req/s. Throttles still pause, but never shrink it |
-| `--max-rate` | `40.0` | Ceiling on the adaptive search. Raise it if your project has more quota |
-| `--start-rate` | `8.0` | Initial req/s. Advanced; useful for repeat runs |
+| `--budget` | `6000` | Quota units per minute to pace against. This is what Gmail meters. Raise it to `15000` if your Cloud project predates 1 May 2026 |
+| `--rate` | unset | Pace in requests per second instead, pinned here. An escape hatch: it ignores what a call costs, so it is only right for one kind of call at a time |
+| `--max-rate` | `40.0` | Ceiling on the adaptive search. Only applies with `--adaptive` |
+| `--start-rate` | `8.0` | Initial req/s for `--adaptive`. Advanced |
 | `--no-rate-limit` | off | Disable pacing entirely. An escape hatch, not a speed-up |
 | `--dropped` | `fetch-dropped.jsonl` | Where unfetchable message IDs are recorded; empty string disables |
 

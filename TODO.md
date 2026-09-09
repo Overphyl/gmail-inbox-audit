@@ -15,7 +15,7 @@ Last updated: 2026-09-09.
 ## Start here
 
 ```bash
-python tests/test_audit.py     # 131 offline tests, no Gmail access, no quota
+python tests/test_audit.py     # 140 offline tests, no Gmail access, no quota
 python tests/check_diagrams.py
 ```
 
@@ -42,6 +42,7 @@ only against fixtures.
 | `trash --execute` | 1,108 messages, 2 senders, confirmed in Gmail |
 | manifest → `untrash` → `INBOX` restored | 1,107/1,108, confirmed in the inbox |
 | throttle diagnosis, rate and concurrency sweep | 7 runs x 2,000 messages, one at a time |
+| unit-aware limiter, all three costs | fetch 900+557, trash 557, untrash 557 - 1 throttle total |
 
 The one failure was a `Precondition check failed` race, retried by hand and now
 classified `TRANSIENT`.
@@ -53,10 +54,11 @@ as a source of bugs, because every previous first run was.
 
 - `ui` — the localhost server, preflight and scan progress
 - `rank --review --min-score N`
-- `untrash --cache` (the field repair was done with an ad-hoc script instead)
 - `baseline`
-- `trash` on a batch whose manifest records labels (the verified run predates
-  label recording)
+
+`untrash --cache` and `trash` on a label-recording manifest came off this list
+on 2026-09-09: the 557-message round trip on the nominated test sender
+exercised both, and all 557 were confirmed back in the inbox by query.
 
 ---
 
@@ -130,14 +132,39 @@ scan; a trash run is exactly as expensive as one; a 70-page enumeration is 6%
 of one minute. The keyring-surcharge hypothesis is dead, and with it the
 suggestion that `DESIGN-UI.md` rejected direct HTTPS on a false premise.
 
-**4. Fix the limiter — now unblocked, and the target has changed.** Item 3
-delivered the mechanism, so this is no longer gated. Read
-`docs/PLAN-RATE-LIMITER.md`, "the throttle, diagnosed", first: AIMD on
-instantaneous rate is the wrong controller for a per-minute budget, so items
-1-2 of "What to change" prevent the collapse without addressing it. The
-budget looks like a constant, which means the minimal correct controller may
-not be adaptive at all — `--rate 5` already is one. Do not tune constants
-without re-measuring; that is how the current ones were arrived at.
+**4. ~~Fix the limiter.~~ Done, 2026-09-09.** The limiter paces **quota units
+per minute** and charges each call its published price, so one constant
+(`UNITS_PER_MINUTE = 6000`) paces every command correctly: 300 messages/minute
+for a scan or a trash, 1,200 calls/minute for an untrash or a modify. It is not
+adaptive, because a published constant has nothing to search for. `--rate`
+still pins req/s as the escape hatch and `--adaptive` still reaches the broken
+AIMD controller; `--budget` refuses to combine with either.
+
+Measured on the reference mailbox with the shipped default, no flags:
+
+| command | messages | throughput | of budget | throttles | lost |
+|---|---|---|---|---|---|
+| `fetch` | 900 | 5.02 msg/s | 100% | 0 | 0 |
+| `fetch` | 557 | 5.00 msg/s | 100% | 0 | 0 |
+| `trash` | 557 | 5.00 msg/s | 100% | 1 | 0 |
+| `untrash` | 557 | 1.47 msg/s | 15% | 0 | 0 |
+
+The same fetch work under the old `--rate 8` default drew 488 throttles and
+lost 2 messages per 2,000. The restore is latency-bound at 15% of budget, which
+is the case a single req/s number could never pace: `--rate 8` was 160% of
+budget on a scan and 40% of it on a restore at the same time.
+
+The offline fleet simulation was replaced too. It metered arrivals over a
+trailing *second*, under which AIMD converges by construction — which is why
+green tests never predicted a real run. It now meters units over a minute, and
+reproduces the pathology: pinned at 8 req/s the fleet delivers the same 300
+msg/min while wasting 37.6% of its requests.
+
+**Still open, and small:** `server_errors` is not in the status payload, so
+`TRANSIENT` retries are invisible on disk. The 557-message restore ran at 1.47
+msg/s where an earlier one managed 2.58 with *half* the workers, and the
+likeliest cause is those retries taking local backoff — but nothing recorded
+can confirm it. See the end of `docs/PLAN-RATE-LIMITER.md`.
 
 ---
 
@@ -165,7 +192,8 @@ backlog.
 - `untrash` restores only `INBOX` (`RESTORE_LABELS`). Other labels survived the
   measured round trip untouched. If another turns out to be lost, the manifest
   already records every label and that tuple is the one edit.
-- The adaptive limiter is broken and opt-in behind `--adaptive`.
+- The adaptive limiter is broken and opt-in behind `--adaptive`. Nothing
+  uses it: the default paces the quota budget, which needs no search.
 - **The mailbox is quota-bound at 300 messages/minute (5.0 msg/s) and no
   client-side knob raises it.** That is `6,000 quota units per minute per user`
   divided by the 20 units a `messages.get` costs - Google's published numbers,

@@ -219,6 +219,49 @@ the review file. Weakening a safeguard silently is how a surprise arrives at
 trash time; the number is also what tells a user whether another
 `--important-guard` mode would move that row.
 
+**The limiter paces QUOTA UNITS PER MINUTE, not requests per second, and the
+price depends on the method.** `messages.get` and `messages.trash` cost 20
+units; `messages.list`, `messages.untrash` and `messages.modify` cost 5. The
+budget is `UNITS_PER_MINUTE` (6,000 per user per minute). One requests-per-
+second number cannot express that, and the proof is what shipped before:
+`--rate 8` was simultaneously **160% of budget on a scan and 40% of it on a
+restore**, which is exactly why a fetch spent its life throttled while a
+1,108-message restore drew not a single throttle. Do not "simplify" the cost
+table away, and do not reintroduce a req/s default.
+
+`METHOD_UNITS` is Google's published table, not a tuning parameter. Editing a
+number there silently repaces every command. `test_the_published_prices_are_the_ones_in_the_table`
+pins all five and the 300-messages-per-minute ceiling that falls out of them.
+
+**A retry is charged again.** `gws()` computes the cost once and pays it on
+every attempt, including throttled ones, because the API metered the attempt
+as surely as the fleet made it. Charging only successes would let a run that
+is already over budget quietly go further over.
+
+**In budget mode the limiter is not adaptive, and that is the fix, not a gap.**
+The budget is a published constant, so there is nothing to search for. AIMD is
+still reachable behind `--adaptive` and is still broken; `--rate` still pins
+requests per second and is still the escape hatch that produced the only
+usable run before any of this was understood. All three modes are one GCRA:
+`reserve(cost)` paces `cost` per arrival, and `cost` is 1 in req/s mode. Do not
+fork it into two limiters.
+
+**Never render the budget-mode rate as req/s.** `_rate` is units per second
+there - 100 of them - and printing "limit 100.0/s" reads as 100 requests a
+second, twenty times the truth and the most misleading number this tool could
+show. `_progress_line`, `_pacing_note` and `_status_lines` all branch on
+`budget`, and two tests hold them to it.
+
+**The offline fleet simulation models a per-minute unit budget.** It used to
+meter arrivals over a trailing *second*, under which a rate cut immediately
+and proportionally reduces throttling - so AIMD converged by construction and
+the headline test was asserting a property of the simulation rather than of
+the limiter. This file said the quota was per minute the whole time. If you
+change `_simulate`, keep it metering units over a minute, and keep
+`test_a_requests_per_second_pin_overruns_the_budget`: it reproduces the
+measured pathology (same throughput, ~38% of requests wasted) and fails if the
+default ever goes back to pinning req/s.
+
 **The UI is loopback-only and token-gated.** `http.server` binds `0.0.0.0` by
 default, which would put a scan trigger — and, if phase 4 is ever built, mail
 deletion — on every interface of the machine. `_ui_bind_address()` *raises* on anything else
@@ -325,7 +368,7 @@ docs/SETUP.md             OAuth setup, troubleshooting, platform notes
 docs/DESIGN-UI.md         proposed web UI (not implemented; Phase 1 shipped)
 docs/PLAN-RATE-LIMITER.md how the shared rate limiter works, and why
 docs/images/*.svg         hand-authored setup diagrams
-tests/test_audit.py       131 offline tests, no API access needed
+tests/test_audit.py       140 offline tests, no API access needed
 tests/fixtures/           synthetic headers, example.com domains only
 tests/check_diagrams.py   geometric checks on the SVGs
 ```
@@ -336,7 +379,8 @@ tests/check_diagrams.py   geometric checks on the SVGs
 |---|---|
 | Subprocess wrapper, retry budgets | `gws()` |
 | The only place a subprocess is spawned | `_run()` |
-| Shared adaptive pacing | `RateLimiter`, `LIMITER` |
+| Shared pacing, in quota units | `RateLimiter`, `LIMITER` |
+| What a call costs, and the budget | `UNITS_PER_MINUTE`, `METHOD_UNITS`, `units_for()`, `RateLimiter.cost_of()` |
 | Throttle vs. transient classification | `THROTTLE`, `TRANSIENT`, `_retryable()` |
 | Live counters, drop file, circuit breaker | `FetchProgress`, `PROGRESS` |
 | Progress line and reporter thread | `_progress_line()`, `_progress_reporter()` |
@@ -483,7 +527,12 @@ instantaneous rate is the wrong controller for a per-minute budget.
 `docs/PLAN-RATE-LIMITER.md`, "Measured against a real mailbox", has the numbers
 and the mechanism.
 
-**So a scan pins `RATE_DEFAULT` (8.0 req/s) and the adaptive controller is
+*Superseded on 2026-09-09: a scan now paces against the unit budget, and
+neither req/s mode is the default any more. The paragraph below records why
+pinning beat adapting, which is still true and is still why `--adaptive` is
+opt-in.*
+
+**So a scan pinned `RATE_DEFAULT` (8.0 req/s) and the adaptive controller is
 opt-in behind `--adaptive`.** That is the inversion of what shipped, and it
 stands until the controller is fixed: the broken half must not be what a first
 run gets. `--rate 0` still means "adapt", which is what it has always meant.

@@ -175,17 +175,51 @@ def _record_throttle(limiter, kind, stderr):
         pass
 
 
-RATE_DEFAULT = 8.0       # req/s the scan PINS unless --adaptive is passed.
-                         # Measured against a real mailbox on 2026-09-08: pinned
-                         # here it held 5.17 msg/s where the adaptive controller
-                         # collapsed to the 1.0 floor and managed 3.66. Not a
-                         # tuned optimum, just the fastest thing known to be
-                         # stable. See docs/PLAN-RATE-LIMITER.md.
+# The quota is a per-MINUTE budget of units, and units per request are NOT
+# constant. Measured 2026-09-09 and then confirmed against Google's published
+# table: 6,000 units/minute/user, and a messages.get costs 20 of them. Seven
+# runs across a 3.2x range of pinned req/s and a 3x range of concurrency all
+# settled within 5% of 6,000 units/minute, so this is the real constraint and
+# req/s never was.
+#
+# Pacing in req/s could not express it. RATE_DEFAULT of 8.0 req/s is 9,600
+# units/minute on a scan - 160% of budget - and 2,400 on a restore, 40% of it:
+# one number, set 60% too fast for the command that reads mail and 2.5x too
+# slow for the command that puts it back. That is why a scan spent its life
+# throttled and lost messages while a 1,108-message restore drew not one
+# throttle.
+UNITS_PER_MINUTE = 6000.0   # per user, per project. --budget overrides it.
+UNITS_DEFAULT_COST = 5.0    # anything not in the table below
+
+# https://developers.google.com/workspace/gmail/api/reference/quota
+# Keyed by the verb _call_kind() reads out of the argument list.
+METHOD_UNITS = {
+    "list": 5.0,
+    "get": 20.0,      # a scan and a trash are the expensive ones...
+    "trash": 20.0,
+    "untrash": 5.0,   # ...and putting it back is four times cheaper
+    "modify": 5.0,
+}
+
+
+def units_for(kind):
+    """Quota units one call of this method costs."""
+    return METHOD_UNITS.get(kind, UNITS_DEFAULT_COST)
+
+
+RATE_DEFAULT = 8.0       # req/s a --rate pin defaults to. NOT the default
+                         # pacing any more: see UNITS_PER_MINUTE above.
+                         # Kept because --rate is the escape hatch, and
+                         # 8.0 is still the only req/s ever observed stable.
 RATE_START = 8.0         # req/s at launch of an --adaptive search
 RATE_MIN = 1.0           # never reach zero; also bounds Ctrl-C latency
 RATE_MAX = 40.0          # between the last clean run (35.7/s) and the first
                          # that dropped messages (44.6/s)
-RATE_BURST = 4           # requests admitted instantaneously
+RATE_BURST = 4           # calls admitted instantaneously. In budget mode
+                         # the allowance is 4 calls OF THE COST BEING PACED,
+                         # so it is 80 units for a get and 20 for a modify -
+                         # a burst is four requests either way, which is what
+                         # the number has always meant.
 RAMP_STEP = 1.0          # additive increase, req/s
 RAMP_INTERVAL = 3.0      # ...at most this often
 THROTTLE_FACTOR = 0.7    # multiplicative decrease
@@ -212,7 +246,19 @@ class RateLimiter:
 
     def __init__(self, rate=RATE_START, burst=RATE_BURST, min_rate=RATE_MIN,
                  max_rate=RATE_MAX, adaptive=True, clock=time.monotonic,
-                 sleeper=time.sleep):
+                 sleeper=time.sleep, budget=None):
+        # budget: units per minute. When set, the limiter paces QUOTA UNITS
+        # per second instead of requests per second and cost_of() charges each
+        # call the published price of its method. When None the limiter is
+        # exactly what it always was - one token per request - which is what
+        # --rate and --adaptive still select and what every existing caller
+        # gets by passing nothing.
+        self.budget = None if budget is None else float(budget)
+        if self.budget is not None:
+            rate = self.budget / 60.0
+            min_rate = min(min_rate, rate)
+            max_rate = max(max_rate, rate)
+            adaptive = False
         self._clock = clock
         self._sleeper = sleeper
         self._lock = threading.Lock()
@@ -250,11 +296,25 @@ class RateLimiter:
         with self._lock:
             return self._rate
 
-    def reserve(self):
-        """Claim the next departure slot. Returns the instant to depart."""
+    def cost_of(self, kind):
+        """What one call of this method costs the pacer.
+
+        One in budget mode is the published unit price; one in req/s mode is
+        one request, which is the whole of the old behaviour.
+        """
+        return units_for(kind) if self.budget is not None else 1.0
+
+    def reserve(self, cost=1.0):
+        """Claim the next departure slot. Returns the instant to depart.
+
+        cost generalises GCRA from "one token per arrival" to "this many".
+        _rate is per second in whatever unit cost is denominated in, so
+        cost=1 with _rate in req/s is byte-for-byte the old arithmetic.
+        """
+        cost = max(float(cost), 1e-9)
         with self._lock:
             now = self._clock()
-            interval = 1.0 / self._rate
+            interval = cost / self._rate
             # Tolerance is (B-1)/R, not B/R: with burst B the Bth request
             # still departs immediately and the (B+1)th waits one interval.
             tolerance = (self._burst - 1) * interval
@@ -270,13 +330,13 @@ class RateLimiter:
             self._maybe_increase(now)
             return deadline
 
-    def acquire(self):
+    def acquire(self, cost=1.0):
         """reserve(), then sleep until the deadline in <=1s slices.
 
         Short slices are what make shutdown() observable: a worker parked at
         the rate floor would otherwise be uninterruptible for many seconds.
         """
-        deadline = self.reserve()
+        deadline = self.reserve(cost)
         while True:
             with self._lock:
                 if self._stopped:
@@ -374,6 +434,8 @@ class RateLimiter:
 
     def _state(self, now):
         """The caller holds the lock."""
+        if self.budget is not None:
+            return "budget"
         if not self.adaptive:
             return "pinned"
         if self._rate <= self._min + 1e-9:
@@ -391,6 +453,12 @@ class RateLimiter:
         with self._lock:
             return {
                 "rate": self._rate,
+                "budget": self.budget,
+                # Requests per second the budget works out to for the method
+                # a scan spends nearly all its calls on. This is the number a
+                # person wants when they ask how fast the scan will go.
+                "get_rate": (None if self.budget is None
+                             else self._rate / units_for("get")),
                 "min_rate": self._min,
                 "max_rate": self._max,
                 "burst": self._burst,
@@ -446,13 +514,16 @@ def gws(args, sanitize=None, retries=6, throttle_retries=12, limiter=None):
         cmd += ["--sanitize", sanitize]
     lim = LIMITER if limiter is None else limiter
     kind = _call_kind(args)
+    # Charged at the method's published price. A retry pays again, because the
+    # API charged for the attempt as surely as the fleet made it.
+    cost = lim.cost_of(kind) if lim is not None else 1.0
     delay = 2.0
     last = ""
     transient_left = retries
     throttle_left = throttle_retries
     while True:
         if lim is not None:
-            lim.acquire()
+            lim.acquire(cost)
         p = _run(cmd)
         if p.returncode == 0:
             if lim is not None:
@@ -801,6 +872,14 @@ def _progress_line(progress, limiter):
     st = limiter.stats() if limiter is not None else None
     if st is None:
         pace = "limit off"
+    elif st.get("budget") is not None:
+        # NOT "limit 100.0/s": _rate is units per second in budget mode, and a
+        # reader would take that number for requests.
+        # No state word: _state() returns "budget" here, and "budget
+        # 6000u/min budget" is what that renders as. The pinned/adaptive
+        # branch needs its state because those have several; this has one.
+        pace = "budget {:.0f}u/min {:<5}".format(
+            st["budget"], "{:.0f} msg/min".format(st["get_rate"] * 60))
     else:
         pace = "limit {:.1f}/s {:<11}".format(st["rate"], st["state"])
     total = "{:,}".format(p["total"])
@@ -916,6 +995,7 @@ class StatusWriter:
             "aborted": p["aborted"],
             "limiter": None if st is None else {
                 "rate": st["rate"], "state": st["state"],
+                "budget": st["budget"],
                 "throttles": st["throttles"],
                 # Both bounded: kinds has one key per API method, samples is
                 # capped at THROTTLE_SAMPLES. A status file a reader polls
@@ -1013,7 +1093,9 @@ def _status_lines(d):
     )
     lim = d.get("limiter") or {}
     bits = []
-    if lim:
+    if lim and lim.get("budget") is not None:
+        bits.append("budget {:.0f}u/min".format(lim["budget"]))
+    elif lim:
         bits.append("limit {:.1f}/s {}".format(lim["rate"], lim["state"]))
     if lim.get("throttles"):
         bits.append("thr " + _fmt_throttles(lim))
@@ -1071,6 +1153,15 @@ def _pacing_note(a):
             workers, ceiling
         )
     st = LIMITER.stats()
+    if st["budget"] is not None:
+        # Quoted in messages as well as units: units are what Gmail meters,
+        # messages are what the operator is waiting for.
+        return (
+            "  pacing: {:.0f} quota units/min; a get costs {:.0f}, so "
+            "<= {:.0f} msg/min ({:.1f}/s)\n"
+            "          {} workers imply <= {:.0f} req/s".format(
+                st["budget"], units_for("get"), st["get_rate"] * 60,
+                st["get_rate"], workers, ceiling))
     if not st["adaptive"]:
         how = "pinned at {:.1f} req/s".format(st["rate"])
     else:
@@ -3345,10 +3436,16 @@ def _add_rate_args(sub, dropped_default=None, status_default=None):
     # have believed you were asking for. _make_limiter refuses it with the
     # answer attached. Hence default=None: it is the only way to tell "--rate 8"
     # from the default, and the conflict is exactly about what was TYPED.
+    sub.add_argument("--budget", type=float, default=None,
+                     help="quota units per minute to pace against (default "
+                          "{:.0f}). This is what Gmail actually meters: a get "
+                          "costs 20 units and an untrash 5, so one number "
+                          "paces every command correctly".format(
+                              UNITS_PER_MINUTE))
     sub.add_argument("--rate", type=float, default=None,
-                     help="pin a fixed req/s (default {}). Throttles still "
-                          "pause but never shrink a pinned rate. 0 means "
-                          "adapt".format(RATE_DEFAULT))
+                     help="pace in req/s instead, pinned here. The escape "
+                          "hatch: it ignores what a call costs, so it is only "
+                          "right for one method at a time. 0 means adapt")
     sub.add_argument("--adaptive", action="store_true",
                      help="search for the rate instead of pinning it. "
                           "KNOWN BROKEN on a per-minute quota: it collapses "
@@ -3372,13 +3469,48 @@ def _add_rate_args(sub, dropped_default=None, status_default=None):
 
 
 def _make_limiter(a):
-    """Resolve the process-wide limiter from the parsed arguments."""
+    """Resolve the process-wide limiter from the parsed arguments.
+
+    The default is the budget, because the budget is what Gmail enforces.
+    --rate and --adaptive pace in requests per second, which cannot express a
+    constraint whose price varies by method; they are kept as the escape
+    hatch that produced the one usable run before any of this was understood.
+    """
     if not hasattr(a, "max_rate") or getattr(a, "no_rate_limit", False):
         return None
     # getattr, not attribute access: the UI and several tests build a namespace
     # by hand and predate these flags.
     rate = getattr(a, "rate", None)
     adaptive = getattr(a, "adaptive", False)
+    budget = getattr(a, "budget", None)
+    if budget is not None and (rate is not None or adaptive):
+        # Same house style as the --rate/--adaptive refusal below: say what is
+        # rejected and what the real choices are. "Pace by units and also by
+        # requests" is a coherent thing to have believed you were asking for.
+        choices = [
+            ("--budget {:g}".format(budget), "pace by quota units, per method"),
+            ("--rate {:g}".format(rate) if rate is not None else "--adaptive",
+             "pace by requests, ignoring what they cost"),
+            ("(nothing)",
+             "pace by the {:g} unit/min budget, the measured default".format(
+                 UNITS_PER_MINUTE)),
+        ]
+        w = max(len(opt) for opt, _ in choices) + 4
+        sys.exit(
+            "--budget paces in quota units per minute; --rate and --adaptive "
+            "pace in\nrequests per second. One run cannot do both.\n\n"
+            "{}\n\n"
+            "Unless you are investigating the limiter, drop the "
+            "per-second flags: they\ncannot express a limit whose price "
+            "depends on the method.".format(
+                "\n".join("  {:<{w}}{}".format(o, t, w=w)
+                            for o, t in choices)))
+    if rate is None and not adaptive:
+        # The default, and the whole point of this phase.
+        return RateLimiter(
+            budget=UNITS_PER_MINUTE if budget is None else budget,
+            burst=RATE_BURST, min_rate=RATE_MIN, max_rate=a.max_rate,
+        )
     if rate is not None and adaptive:
         # Columns computed, not hand-padded: the option strings carry the rate
         # the user typed, so their width is not known here.

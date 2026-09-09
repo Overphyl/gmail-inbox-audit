@@ -995,3 +995,110 @@ surcharge to explain. Subprocess cost is latency, exactly as
 `DESIGN-UI.md` assumed. That decision stands on its original grounds.
 
 Sources: Gmail API [usage limits](https://developers.google.com/workspace/gmail/api/reference/quota).
+
+---
+
+## The fix: pace the budget, 2026-09-09
+
+The diagnosis above is the whole specification. The limiter paced **requests
+per second** against a constraint denominated in **quota units per minute**,
+where the price depends on the method - so one number was necessarily wrong
+for at least one command, and it was:
+
+| | offered | in units/min | against 6,000 |
+|---|---|---|---|
+| `fetch` at `--rate 8` | 8 get/s | 9,600 | **160%** |
+| `untrash` at `--rate 8` | 8 mutate/s | 2,400 | 40% |
+
+Simultaneously 60% too fast for the command that reads mail and 2.5x too slow
+for the command that puts it back. That is not a tuning error, it is a units
+error, and no constant could have fixed it.
+
+### What changed
+
+**One constant replaces the rate.** `UNITS_PER_MINUTE = 6000`, plus
+`METHOD_UNITS` - Google's published table, not a tuning parameter. Every
+command paces itself correctly from those: 300 messages/minute for a scan or a
+trash, 1,200 calls/minute for an untrash or a modify.
+
+**GCRA generalises rather than forks.** `reserve()` became `reserve(cost)`:
+instead of one token per arrival, `cost` per arrival, so the interval is
+`cost / rate` rather than `1 / rate`. In budget mode `rate` is units per
+second and `cost` is the method's price; in `--rate` mode `rate` is requests
+per second and `cost` is 1, which is byte-for-byte the old arithmetic. **One
+limiter, three modes**, and every existing caller kept working unchanged
+because `cost` defaults to 1.
+
+**A retry pays again.** The API metered the attempt as surely as the fleet made
+it, and charging only successes would let a run already over budget go further
+over.
+
+**Adaptation is gone from the default path.** The budget is a published
+constant; there is nothing to search for. `--adaptive` still reaches the AIMD
+controller and it is still broken. `--rate` still pins requests per second and
+is still the escape hatch that produced the only usable run before any of this
+was understood. `--budget` refuses to combine with either, because they are
+different units and silently letting one win is how a run ends up paced by
+something the operator did not choose.
+
+### The simulation was the other half of the bug
+
+`_simulate()` metered **arrivals over a trailing second**. Under that model a
+rate cut immediately and proportionally reduces throttling, so AIMD converges
+by construction - the headline test asserting ">20 msg/s sustained" was
+asserting a property of the simulation. `CLAUDE.md` had said the quota was per
+minute the entire time.
+
+It now meters **units over a minute**, and rejected calls are charged nothing,
+which is what the real runs showed: successes pinned near 300/min while
+attempts ranged 300-479. Against that model:
+
+| | sustained | throttled |
+|---|---|---|
+| budget 6,000 | 302 msg/min | 0.3% of attempts |
+| pinned 8 req/s | 300 msg/min | **37.6% of attempts** |
+
+Identical throughput; the old default simply wasted 38% of its requests. That
+comparison is now `test_a_requests_per_second_pin_overruns_the_budget`, and it
+fails if the default ever goes back to pinning req/s.
+
+The ">20 msg/s" done-when from `DESIGN-UI.md` is retired. It was set before
+anyone had read a throttle and it is not reachable on this API at any
+concurrency, by any client: 6,000 units a minute divided by the 20 a
+`messages.get` costs is 300 messages a minute. The replacement criterion is to
+spend the whole budget and draw almost nothing.
+
+### Measured against the real mailbox, same day
+
+Three runs on one sender (953 messages, 557 of them in the inbox), which the
+repo owner nominated as an expendable test case. Every run used the shipped
+default - no `--rate`, no `--budget`.
+
+| run | calls/message | messages | throughput | units/min | of budget | throttles | lost |
+|---|---|---|---|---|---|---|---|
+| `fetch` (get, 20u) | 1 | 900 | 5.02 msg/s | 6,024 | 100% | **0** | **0** |
+| `fetch` (get, 20u) | 1 | 557 | 5.00 msg/s | 6,000 | 100% | **0** | **0** |
+| `trash` (trash, 20u) | 1 | 557 | 5.00 msg/s | 6,004 | 100% | **1** | **0** |
+| `untrash` (untrash+modify, 5u each) | 2 | 557 | 1.47 msg/s | 884 | 15% | **0** | **0** |
+
+The first three sit exactly on the ceiling and draw essentially nothing, where
+the same work under `--rate 8` drew 488 throttles and lost 2 messages per
+2,000. The fourth is the point of the whole exercise: a cheap path is *not*
+constrained to the expensive path's rate. It is latency-bound at 15% of budget,
+and the limiter correctly stays out of its way.
+
+All 557 were restored and confirmed in the mailbox: 557 back in the inbox, 0
+left in Trash, checked by query rather than by trusting the tool's own count.
+That run also exercised two things `TODO.md` listed as never having run for
+real - `trash` on a batch whose manifest records labels, and `untrash --cache`
+- and both were clean.
+
+**One thing is unexplained and is written down rather than guessed at.** The
+restore managed 1.47 msg/s at concurrency 16, where the 1,108-message restore
+on 2026-09-09 managed 2.58 msg/s at concurrency 8. More workers, less
+throughput, no throttles and no drops either time. The live line dipped to 0.9
+msg/s for stretches, which is the signature of `TRANSIENT` retries taking their
+local exponential backoff - `Precondition check failed` is a known race on
+exactly this path. Those retries are invisible: they are counted in the
+limiter's `server_errors` and that field is not in the status payload, so
+nothing on disk can confirm it. Adding it is the cheap next measurement.

@@ -464,32 +464,42 @@ displayed.
 
 ## Rate limits
 
-Gmail enforces quota **per minute**, not per second. `messages.get` costs 5
-units.
+Gmail meters **quota units per minute, per user** - not requests per second -
+and different calls cost different amounts:
 
-**The tool paces itself at a fixed 8 req/s.** One rate limiter, shared by every
-worker. The scan prints its current rate and state (`pinned`, `backoff 4s`, ...)
-as it runs. You should not normally need to tune anything; `--rate` changes the
-pin and `--max-rate` raises the ceiling if your project has more quota.
+| call | units | what that allows |
+|---|---|---|
+| `messages.list` | 5 | 1,200 pages/min |
+| `messages.get` | **20** | **300 messages/min** |
+| `messages.trash` | **20** | **300 messages/min** |
+| `messages.untrash` | 5 | |
+| `messages.modify` | 5 | 600 messages/min for an undo, which uses both |
 
-There is also an adaptive controller that searches for the rate, behind
-`--adaptive`. **Do not use it.** Measured against a real mailbox, it collapses
-to the 1.0 req/s floor and is 32% slower than simply pinning:
+The budget is **6,000 units per minute** for projects created on or after
+1 May 2026. Older projects kept 15,000; pass `--budget 15000` if yours is one.
 
-| run | throughput | throttled | limiter rate |
-|---|---|---|---|
-| `--adaptive`, concurrency 12 | 3.66 msg/s | 21% | 3.63 to **1.00 floor** |
-| `--adaptive`, concurrency 4 | 3.91 msg/s | 11% | 8.0 to 2.58, falling |
-| pinned `--rate 8`, concurrency 4 | **5.17 msg/s** | 20% | **8.00 stable** |
+**The tool paces itself against that budget and charges each call its real
+price**, so every command runs at the right speed from one number. You should
+not need to tune anything. A full scan therefore tops out near **5 messages a
+second**, and that is the API's ceiling rather than the tool's - no setting,
+and no amount of concurrency, goes faster.
 
-The cause is that quota is per minute, so cutting the rate cannot refund units
-already spent in the current minute: a 72% rate cut *raised* throttle frequency
-by 7%. AIMD on instantaneous rate is the wrong controller for a per-minute
-budget. `docs/PLAN-RATE-LIMITER.md` has the mechanism and what to change.
+Measured on a real mailbox with the default pacing:
 
-Rate and concurrency are separate knobs now. The limiter governs the rate;
-`--concurrency` only covers request latency, so about `rate * 0.35` workers are
-needed to sustain a given rate.
+| command | throughput | quota used | throttled | lost |
+|---|---|---|---|---|
+| `fetch` | 5.02 msg/s | 100% | 0 | 0 |
+| `trash` | 5.00 msg/s | 100% | 1 | 0 |
+| `untrash` | 1.47 msg/s | 15% | 0 | 0 |
+
+`--rate` pins requests per second instead. It is an escape hatch: because it
+ignores what a call costs, it can only be right for one kind of call at a time.
+There is also an adaptive controller behind `--adaptive` that searches for a
+request rate. **Do not use it.** It collapses to the 1.0 req/s floor, and a
+search is the wrong idea anyway - the budget is a published constant.
+
+Rate and concurrency are separate knobs. The budget governs the pace;
+`--concurrency` only covers request latency.
 
 **Never go above `--concurrency 16`.** Above that the API drops messages, which
 undercounts senders and corrupts the ranking — a correctness problem, not a

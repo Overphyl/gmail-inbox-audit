@@ -404,41 +404,57 @@ class _FakeTransport(object):
         return _Proc(1, "", "unexpected argv: " + " ".join(argv[:5]))
 
 
-def _simulate(ceiling, duration=300.0, workers=12, latency=0.35, limiter=None):
+def _simulate(budget, duration=600.0, workers=12, latency=0.35, limiter=None,
+              method="get", window=60.0):
     """Run a virtual fleet against a virtual API, with no threads at all.
 
-    The API returns 429 whenever arrivals over the trailing second have
-    already reached `ceiling`. Because reserve() never sleeps, the whole
-    fleet is a heap of (time, worker, event) tuples over a clock the loop
-    advances itself. Runs in single-digit milliseconds.
+    The API meters QUOTA UNITS over a trailing MINUTE, which is what Gmail
+    actually does and what the error text says: a call of cost c is rejected
+    when the last `window` seconds already hold `budget` units. A rejected
+    call is charged nothing, which is the behaviour the real runs showed -
+    successes stayed pinned at 300/min while attempts ranged over 300-479.
+
+    The previous version of this function metered ARRIVALS over a trailing
+    SECOND. Under that model a rate cut immediately and proportionally
+    reduces throttling, so AIMD converges by construction and the headline
+    test was asserting a property of the simulation. CLAUDE.md had said all
+    along that the quota is per minute; the simulation encoded the shape the
+    documentation explicitly called wrong, and that is why five months of
+    green tests never predicted a real run.
+
+    Because reserve() never sleeps, the whole fleet is a heap of
+    (time, worker, event) tuples over a clock the loop advances itself.
     """
     clock = _Clock(0.0)
-    lim = limiter or g.RateLimiter(rate=8.0, burst=4, max_rate=40.0, clock=clock)
+    lim = limiter or g.RateLimiter(budget=budget, burst=4, clock=clock)
     lim._clock = clock
+    cost = lim.cost_of(method)
+    price = g.units_for(method)
     heap = [(0.0, i, "reserve") for i in range(workers)]
     heapq.heapify(heap)
-    arrivals = collections.deque()
+    spent = collections.deque()   # (instant, units)
     completed = []
-    throttled = 0
+    attempts = throttled = 0
     while heap:
         t, wid, kind = heapq.heappop(heap)
         if t > duration:
             break
         clock.t = t
         if kind == "reserve":
-            heapq.heappush(heap, (max(t, lim.reserve()), wid, "send"))
+            heapq.heappush(heap, (max(t, lim.reserve(cost)), wid, "send"))
             continue
-        while arrivals and arrivals[0] < t - 1.0:
-            arrivals.popleft()
-        if len(arrivals) >= ceiling:
+        attempts += 1
+        while spent and spent[0][0] < t - window:
+            spent.popleft()
+        if sum(u for _, u in spent) + price > budget:
             lim.on_throttle()
             throttled += 1
         else:
-            arrivals.append(t)
+            spent.append((t, price))
             lim.on_success()
             completed.append(t + latency)
         heapq.heappush(heap, (t + latency, wid, "reserve"))
-    return lim, completed, throttled
+    return lim, completed, throttled, attempts
 
 
 def _sustained(completed, duration, window=60.0):
@@ -530,16 +546,20 @@ def _parse_fetch(argv):
         sys.argv = orig
 
 
-def test_a_scan_pins_its_rate_by_default():
-    """The adaptive controller is measurably worse than a fixed rate on a real
-    mailbox: it collapses to the 1.0 floor and manages 3.66 msg/s where pinned
-    at 8 held 5.17. Until that is fixed, the broken half is opt-in rather than
-    the thing every first run gets."""
+def test_a_scan_paces_against_the_quota_budget_by_default():
+    """Requests per second cannot express this quota, so the default no longer
+    tries. Gmail meters units per minute and the price depends on the method:
+    a get costs 20 and an untrash 5, so one req/s number is necessarily wrong
+    for at least one of them. The old default of 8.0 req/s was 160% of budget
+    on a scan and 40% of it on a restore."""
     a = _parse_fetch([])
-    assert a.rate is None and a.adaptive is False, a
+    assert a.rate is None and a.adaptive is False and a.budget is None, a
     lim = g._make_limiter(a)
-    assert lim.rate == g.RATE_DEFAULT, lim.rate
+    assert lim.budget == g.UNITS_PER_MINUTE, lim.budget
     assert lim.adaptive is False, "the default must not search for a rate"
+    # Units per second, so the pinned req/s default must NOT be what it holds.
+    assert abs(lim.rate - g.UNITS_PER_MINUTE / 60.0) < 1e-9, lim.rate
+    assert abs(lim.stats()["get_rate"] * 60 - 300.0) < 1e-6, lim.stats()
 
 
 def test_adaptive_is_still_reachable_two_ways():
@@ -880,6 +900,156 @@ def test_a_scan_completes_when_the_throttle_capture_raises():
         assert st["throttles"] == 4, st
         assert st["throttle_kinds"] == {"list": 1, "get": 3}, st
         assert st["throttle_samples"] == [], st
+
+
+# ------------------------------------------------------ quota unit pricing
+def test_the_published_prices_are_the_ones_in_the_table():
+    """Straight off Google's usage-limits page. These are not tunable and not
+    guesses; the whole diagnosis rests on get being 20 and untrash being 5,
+    and a silent edit here would move the pacing of every command."""
+    assert g.UNITS_PER_MINUTE == 6000.0
+    assert g.units_for("list") == 5.0
+    assert g.units_for("get") == 20.0
+    assert g.units_for("trash") == 20.0
+    assert g.units_for("untrash") == 5.0
+    assert g.units_for("modify") == 5.0
+    # A method nobody has priced must not silently cost nothing.
+    assert g.units_for("someNewMethod") == g.UNITS_DEFAULT_COST > 0
+    # The ceiling the whole phase is about.
+    assert g.UNITS_PER_MINUTE / g.units_for("get") == 300.0
+
+
+def test_the_limiter_charges_each_method_its_own_price():
+    """One req/s number cannot pace two methods whose prices differ 4x. That
+    is not a nicety: at 8 req/s the old default was 160% of budget on a scan
+    and 40% of it on a restore, simultaneously."""
+    clock = _Clock(0.0)
+    lim = g.RateLimiter(budget=6000.0, burst=1, clock=clock)
+    gets = [lim.reserve(lim.cost_of("get")) for _ in range(4)]
+    clock.t = gets[-1]
+    lim2 = g.RateLimiter(budget=6000.0, burst=1, clock=_Clock(0.0))
+    mods = [lim2.reserve(lim2.cost_of("modify")) for _ in range(4)]
+    get_gap = round(gets[1] - gets[0], 6)
+    mod_gap = round(mods[1] - mods[0], 6)
+    assert get_gap == 0.2, get_gap      # 20 units at 100 units/s
+    assert mod_gap == 0.05, mod_gap     # 5 units at 100 units/s
+    assert get_gap == 4 * mod_gap
+    # Which is 300 gets/min and 1,200 modifies/min out of ONE constant.
+    assert round(60.0 / get_gap) == 300
+    assert round(60.0 / mod_gap) == 1200
+
+
+def test_a_pinned_rate_still_charges_one_token_per_request():
+    """--rate is the escape hatch and it means requests per second, exactly as
+    it always did. Budget mode is the default, not the only mode."""
+    clock = _Clock(0.0)
+    lim = g.RateLimiter(rate=10.0, burst=1, adaptive=False, clock=clock)
+    assert lim.budget is None
+    assert lim.cost_of("get") == 1.0 == lim.cost_of("modify")
+    gaps = [lim.reserve(lim.cost_of("get")) for _ in range(3)]
+    assert round(gaps[1] - gaps[0], 6) == 0.1, gaps
+
+
+def test_gws_charges_the_price_of_the_method_it_is_running():
+    """The cost has to reach the pacer from the argument list, or the table is
+    decoration. _call_kind already reads the verb for the throttle split; this
+    is the same seam carrying the price."""
+    charged = []
+    orig_run = g._run
+
+    class _Recorder(g.RateLimiter):
+        def acquire(self, cost=1.0):
+            charged.append(cost)
+
+    try:
+        g._run = lambda cmd: _Proc(0, "{}")
+        lim = _Recorder(budget=6000.0, clock=_Clock(0.0))
+        for verb in ("get", "modify", "untrash", "list", "trash"):
+            g.gws(["gmail", "users", "messages", verb, "--params", "{}"],
+                  limiter=lim)
+    finally:
+        g._run = orig_run
+    assert charged == [20.0, 5.0, 5.0, 5.0, 20.0], charged
+
+
+def test_a_retried_throttle_is_charged_again():
+    """The API metered the attempt as surely as the fleet made it. Charging
+    only successes would let a throttling run quietly re-overrun the budget
+    it is already over."""
+    charged = []
+    responses = [_Proc(1, "", "HTTP 429 Too Many Requests"), _Proc(0, "{}")]
+    orig_run = g._run
+
+    class _Recorder(g.RateLimiter):
+        def acquire(self, cost=1.0):
+            charged.append(cost)
+
+    try:
+        g._run = lambda cmd: responses.pop(0)
+        lim = _Recorder(budget=6000.0, clock=_Clock(0.0))
+        g.gws(["gmail", "users", "messages", "get", "--params", "{}"],
+              limiter=lim)
+    finally:
+        g._run = orig_run
+    assert charged == [20.0, 20.0], charged
+
+
+def test_budget_and_a_pinned_rate_cannot_both_be_asked_for():
+    """They are two different units. Silently letting one win is how a run
+    ends up paced by something the operator did not choose - the same reason
+    --rate and --adaptive refuse each other."""
+    for argv in (["--budget", "3000", "--rate", "8"],
+                 ["--budget", "3000", "--adaptive"]):
+        try:
+            g._make_limiter(_parse_fetch(argv))
+        except SystemExit as e:
+            msg = str(e)
+        else:
+            raise AssertionError("accepted " + " ".join(argv))
+        assert "--budget" in msg and "cannot do both" in msg, msg
+        # It must say what to type instead, not only what is wrong.
+        assert "3000" in msg and "(nothing)" in msg, msg
+
+
+def test_budget_alone_is_honoured():
+    """A mailbox on the older 15,000 unit quota is one flag away."""
+    lim = g._make_limiter(_parse_fetch(["--budget", "15000"]))
+    assert lim.budget == 15000.0
+    assert round(lim.stats()["get_rate"] * 60) == 750
+
+
+def test_the_live_line_never_quotes_units_as_requests():
+    """In budget mode the limiter's internal rate is 100 - units per second.
+    Rendering that as "limit 100.0/s" would read as 100 requests a second,
+    which is twenty times the truth and the most misleading number the tool
+    could print."""
+    lim = g.RateLimiter(budget=6000.0, clock=_Clock(0.0))
+    progress = g.FetchProgress(100)
+    line = g._progress_line(progress, lim)
+    assert "budget 6000u/min" in line, line
+    assert "100.0/s" not in line, line
+    # ...and the same through the status file, which another process reads.
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "s.json")
+        g.StatusWriter(path, "fetch").write(progress, lim)
+        st = g.read_status(path)
+        assert st["limiter"]["budget"] == 6000.0, st["limiter"]
+        assert "budget 6000u/min" in " ".join(g._status_lines(st))
+
+
+def test_the_pacing_note_says_messages_per_minute():
+    """Units are what Gmail meters; messages are what the operator is waiting
+    for. A start-up line quoting only units makes the reader do the division
+    that this whole phase exists to have got right."""
+    orig = g.LIMITER
+    try:
+        g.LIMITER = g.RateLimiter(budget=6000.0, clock=_Clock(0.0))
+        note = g._pacing_note(argparse.Namespace(concurrency=12))
+    finally:
+        g.LIMITER = orig
+    assert "6000 quota units/min" in note, note
+    assert "300 msg/min" in note, note
+    assert "5.0/s" in note, note
 
 
 # ---------------------------------------------------------------- sharing
@@ -2734,25 +2904,53 @@ def test_preflight_labels_do_not_drift():
 
 
 # --------------------------------------------------------------- headline
-def test_fleet_settles_near_a_simulated_ceiling():
-    for ceiling in (10, 20, 35):
-        lim, completed, _ = _simulate(ceiling, duration=300.0)
-        rate = _sustained(completed, 300.0)
-        assert 0.6 * ceiling <= rate <= 1.05 * ceiling, (
-            "ceiling {}: sustained {:.1f} msg/s, rate {:.1f}".format(
-                ceiling, rate, lim.rate)
-        )
+def test_the_budget_limiter_runs_clean_at_the_quota_ceiling():
+    """The done-when criterion, rewritten against the constraint that exists.
 
-
-def test_fleet_clears_the_twenty_messages_per_second_bar():
-    """DESIGN-UI.md's done-when criterion, as an offline assertion.
-
-    The pathology being fixed measured 5.1 msg/s sustained over 53 minutes
-    against the same ceiling.
+    DESIGN-UI.md asked for >20 msg/s sustained. That target was set before
+    anyone had read a throttle, and it is not reachable on this API: 6,000
+    units a minute divided by the 20 a messages.get costs is 300 messages a
+    minute, full stop. The honest criterion is to spend the whole budget and
+    draw almost nothing, which is what the measured `--rate 5` run did - 3
+    throttles and zero lost messages across 2,000 fetches.
     """
-    lim, completed, throttled = _simulate(35, duration=300.0)
-    rate = _sustained(completed, 300.0)
-    assert rate > 20.0, "sustained {:.1f} msg/s, rate {:.1f}".format(rate, lim.rate)
+    for budget in (6000.0, 12000.0):
+        lim, completed, throttled, attempts = _simulate(budget)
+        expected = budget / g.units_for("get") / 60.0
+        rate = _sustained(completed, 600.0)
+        assert 0.9 * expected <= rate <= 1.02 * expected, (
+            "budget {}: sustained {:.2f} msg/s, expected {:.2f}".format(
+                budget, rate, expected))
+        assert throttled <= 0.02 * attempts, (
+            "budget {}: {} throttles in {} attempts".format(
+                budget, throttled, attempts))
+
+
+def test_a_requests_per_second_pin_overruns_the_budget():
+    """The measured pathology, as a regression guard.
+
+    RATE_DEFAULT is 8.0 req/s, and a messages.get costs 20 units, so the old
+    default offered 9,600 units a minute against a budget of 6,000 - 160% of
+    quota. It delivered no more messages than pacing correctly and drew
+    hundreds of throttles doing it, one to three of which cost a message
+    outright. Pinning in req/s cannot express this constraint, and this test
+    fails if the default ever goes back to trying.
+    """
+    clock = _Clock(0.0)
+    pinned = g.RateLimiter(rate=g.RATE_DEFAULT, burst=4, adaptive=False,
+                           clock=clock)
+    _, pin_done, pin_thr, pin_att = _simulate(6000.0, limiter=pinned)
+    _, bud_done, bud_thr, bud_att = _simulate(6000.0)
+
+    assert pin_thr > 0.2 * pin_att, (
+        "the old default should be throttled hard: {}/{}".format(
+            pin_thr, pin_att))
+    assert bud_thr <= 0.02 * bud_att, (
+        "the budget limiter should not be: {}/{}".format(bud_thr, bud_att))
+    # ...and all that throttling bought nothing. Same ceiling, same messages.
+    assert _sustained(pin_done, 600.0) <= 1.05 * _sustained(bud_done, 600.0), (
+        "pinned {:.2f} msg/s vs budget {:.2f} msg/s".format(
+            _sustained(pin_done, 600.0), _sustained(bud_done, 600.0)))
 
 if __name__ == "__main__":
     fns = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
