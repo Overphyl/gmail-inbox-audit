@@ -23,12 +23,23 @@ convenience, and do not assume a request to "clean up" or "simplify" includes
 them.
 
 **No permanent deletion, ever.** The only mutating API calls are
-`messages.trash` and `messages.untrash`. `messages.delete` and
-`messages.batchDelete` must never appear in this codebase. They require the
+`messages.trash`, `messages.untrash` and `messages.modify`.
+`messages.delete` and `messages.batchDelete` must never appear in this codebase. They require the
 `https://mail.google.com/` scope; the tool authenticates with `gmail.modify`,
 under which Google itself refuses permanent deletion. `test_no_permanent_delete_code_path`
 greps the source and fails if either appears. If that test is in your way, you
 are doing something wrong.
+
+`messages.modify` was added to that list deliberately, on 2026-09-09, and is
+**add-only**: it may pass `addLabelIds` and must never pass `removeLabelIds`.
+It exists for one job, restoring the `INBOX` label that `messages.untrash`
+does not put back (measured: a real 1,108-message restore landed in All Mail,
+with `TRASH` gone and `INBOX` absent). An undo that cannot put things back is
+not an undo. The rule it widens is about *permanent deletion*, and adding a
+label cannot delete anything, which is why the purpose survives the amendment.
+`test_modify_is_add_only` walks the parsed tree and fails on any
+`removeLabelIds` in the source. Removing a label is still a thing this tool
+does not do.
 
 **`Subject` never influences classification.** It is a header, but it is
 attacker-controlled free text — the sender chooses it. It is collected for

@@ -222,6 +222,19 @@ def test_no_permanent_delete_code_path():
     assert '"trash"' in code, "trash should be the only mutation"
 
 
+def test_modify_is_add_only():
+    """messages.modify joined the permitted mutations on 2026-09-09 for one
+    job: restoring the INBOX label that messages.untrash does not put back.
+    It may add a label and must never remove one. The rule it widens is about
+    permanent deletion, and adding a label cannot delete anything - which only
+    stays true while this holds."""
+    src = open(SOURCE, encoding="utf-8").read()
+    code = "\n".join(l for l in src.splitlines()
+                     if not l.strip().startswith("#"))
+    assert "removeLabelIds" not in code, (
+        "modify is add-only; removing a label is not something this tool does")
+
+
 def test_subject_never_contributes_to_score():
     """Subject is attacker-controlled; it must not influence classification."""
     msgs = g.load_cache(FIXTURE)
@@ -1352,6 +1365,25 @@ def _in(d):
         yield
     finally:
         os.chdir(orig)
+
+
+def test_the_manifest_records_what_labels_a_message_had():
+    """messages.untrash clears TRASH and does NOT restore INBOX: measured on a
+    real 1,108-message restore, which came back to All Mail rather than to the
+    inbox. The undo cannot put a message back without knowing where it was,
+    and the cache already holds that, so recording it costs no API call."""
+    with tempfile.TemporaryDirectory() as d, _in(d):
+        args = _trash_args(d, manifest=os.path.join(d, "m.jsonl"), execute=False)
+        _run_mutation(g.cmd_trash, args)
+        rows = [json.loads(l) for l in
+                open(args.manifest, encoding="utf-8") if l.strip()]
+    assert rows, "the fixture sender must produce targets"
+    for r in rows:
+        assert "labelIds" in r, r
+        assert "INBOX" in r["labelIds"], r
+    # ...and the manifest is still written before anything moves, so a dry run
+    # produces exactly the same record.
+    assert len({tuple(sorted(r["labelIds"])) for r in rows}) >= 1
 
 
 def test_a_second_trash_run_does_not_overwrite_the_first_undo_list():

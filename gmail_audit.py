@@ -1763,6 +1763,14 @@ def cmd_trash(a):
                     "date": m["headers"].get("date", ""),
                     # truncated, untrusted, recorded for the audit trail only
                     "subject": (m["headers"].get("subject", "") or "")[:80],
+                    # The labels this message had BEFORE it was trashed, taken
+                    # from the cache, so recording them costs no API call.
+                    # messages.untrash clears TRASH and does NOT restore INBOX
+                    # - measured on a real 1,108-message restore, which came
+                    # back to All Mail rather than to the inbox. Without this
+                    # the undo cannot know where a message belonged, and an
+                    # undo that cannot put things back is not an undo.
+                    "labelIds": list(m.get("labelIds") or []),
                 }
             )
 
